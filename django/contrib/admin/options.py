@@ -25,6 +25,7 @@ from django.contrib.admin.checks import (
 from django.contrib.admin.exceptions import DisallowedModelAdminToField, NotRegistered
 from django.contrib.admin.templatetags.admin_urls import add_preserved_filters
 from django.contrib.admin.utils import (
+    COMPOSITE_PK_NULL,
     NestedObjects,
     construct_change_message,
     display_for_value,
@@ -34,6 +35,7 @@ from django.contrib.admin.utils import (
     model_format_dict,
     model_ngettext,
     quote,
+    split_parts,
     unquote,
 )
 from django.contrib.admin.widgets import AutocompleteSelect, AutocompleteSelectMultiple
@@ -967,10 +969,49 @@ class ModelAdmin(BaseModelAdmin):
             model._meta.pk if from_field is None else model._meta.get_field(from_field)
         )
         try:
-            object_id = field.to_python(object_id)
+            object_id = self.to_field_python(field, object_id)
             return queryset.get(**{field.name: object_id})
         except (model.DoesNotExist, ValidationError, ValueError):
             return None
+
+    @staticmethod
+    def to_field_python(field, object_id):
+        """
+        Convert an object_id to Python using the field's to_python().
+
+        For a composite primary key, object_id is a tuple/list of unquoted
+        parts (as returned by ModelAdmin.unquote()); each part is converted
+        with the corresponding component field's to_python(). A raw quoted
+        string is accepted too, in which case it is split and unquoted first.
+        A wrong number of parts raises ValidationError.
+        """
+        if isinstance(field, models.CompositePrimaryKey):
+            if isinstance(object_id, str):
+                object_id = [
+                    None if part == COMPOSITE_PK_NULL else unquote(part)
+                    for part in split_parts(object_id)
+                ]
+            elif not isinstance(object_id, (list, tuple)):
+                raise ValidationError("The composite primary key must be iterable.")
+            parts = list(object_id)
+            if len(parts) != len(field.fields):
+                raise ValidationError(
+                    "The composite primary key must have %d parts." % len(field.fields)
+                )
+            return [
+                None if part is None else component.to_python(part)
+                for component, part in zip(field.fields, parts)
+            ]
+        return field.to_python(object_id)
+
+    def unquote(self, object_id, to_field=None):
+        """Undo quote() on an object_id, splitting a composite key into parts."""
+        if self.opts.is_composite_pk and to_field is None:
+            return tuple(
+                None if part == COMPOSITE_PK_NULL else unquote(part)
+                for part in split_parts(object_id)
+            )
+        return unquote(object_id)
 
     def get_changelist_form(self, request, **kwargs):
         """
@@ -1015,6 +1056,15 @@ class ModelAdmin(BaseModelAdmin):
         self, request, queryset, per_page, orphans=0, allow_empty_first_page=True
     ):
         return self.paginator(queryset, per_page, orphans, allow_empty_first_page)
+
+    def log_object_id(self, obj):
+        """
+        Return the value to store in LogEntry.object_id for obj. Composite
+        primary keys are serialized to a JSON array of their string parts.
+        """
+        if self.opts.is_composite_pk:
+            return self.opts.pk.value_to_string(obj)
+        return str(obj.pk)
 
     def log_addition(self, request, obj, message):
         """
@@ -1074,7 +1124,7 @@ class ModelAdmin(BaseModelAdmin):
             ),
         }
         checkbox = forms.CheckboxInput(attrs, lambda value: False)
-        return checkbox.render(helpers.ACTION_CHECKBOX_NAME, str(obj.pk))
+        return checkbox.render(helpers.ACTION_CHECKBOX_NAME, str(quote(obj.pk)))
 
     @staticmethod
     def _get_action_description(func, name):
@@ -1602,9 +1652,11 @@ class ModelAdmin(BaseModelAdmin):
             to_field = request.POST.get(TO_FIELD_VAR)
             if to_field:
                 attr = str(to_field)
+                value = obj.serializable_value(attr)
+            elif self.opts.is_composite_pk:
+                value = quote(obj.pk)
             else:
-                attr = obj._meta.pk.attname
-            value = obj.serializable_value(attr)
+                value = obj.serializable_value(obj._meta.pk.attname)
             popup_response = {
                 "value": str(value),
                 "obj": str(obj),
@@ -1713,7 +1765,10 @@ class ModelAdmin(BaseModelAdmin):
             to_field = request.POST.get(TO_FIELD_VAR)
             attr = str(to_field) if to_field else opts.pk.attname
             value = request.resolver_match.kwargs["object_id"]
-            new_value = obj.serializable_value(attr)
+            if opts.is_composite_pk:
+                new_value = quote(obj.pk)
+            else:
+                new_value = obj.serializable_value(attr)
             popup_response_data = json.dumps(
                 {
                     "action": "change",
@@ -1904,6 +1959,19 @@ class ModelAdmin(BaseModelAdmin):
 
             if not select_across:
                 # Perform the action only on the selected objects
+                if self.opts.is_composite_pk:
+                    # Selected PKs are quoted composite keys; split them into
+                    # their parts and convert each part.
+                    selected = self._decode_composite_pks(selected)
+                    if selected is None:
+                        msg = _(
+                            "Items must be selected in order to perform "
+                            "actions on them. No items have been changed."
+                        )
+                        self.message_user(request, msg, messages.WARNING)
+                        return None
+                else:
+                    selected = [unquote(value) for value in selected]
                 queryset = queryset.filter(pk__in=selected)
 
             response = func(self, request, queryset)
@@ -2051,7 +2119,7 @@ class ModelAdmin(BaseModelAdmin):
         """
         msg = _("%(name)s with ID “%(key)s” doesn’t exist. Perhaps it was deleted?") % {
             "name": opts.verbose_name,
-            "key": unquote(object_id),
+            "key": self.unquote(object_id),
         }
         self.message_user(request, msg, messages.WARNING)
         url = reverse("admin:index", current_app=self.admin_site.name)
@@ -2083,7 +2151,7 @@ class ModelAdmin(BaseModelAdmin):
             obj = None
 
         else:
-            obj = self.get_object(request, unquote(object_id), to_field)
+            obj = self.get_object(request, self.unquote(object_id, to_field), to_field)
             if not self.has_view_or_change_permission(request, obj):
                 raise PermissionDenied
 
@@ -2125,7 +2193,7 @@ class ModelAdmin(BaseModelAdmin):
                 and "_addanother" not in request.POST
             ):
                 selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
-                if len(selected) != 1 or selected[0] != str(obj.pk):
+                if len(selected) != 1 or selected[0] != str(quote(obj.pk)):
                     raise BadRequest
                 queryset = self.get_queryset(request)
                 if response := self.response_action(
@@ -2265,14 +2333,46 @@ class ModelAdmin(BaseModelAdmin):
         """
         object_pks = self._get_edited_object_pks(request, prefix)
         queryset = self.get_queryset(request)
-        validate = queryset.model._meta.pk.to_python
+        pk = queryset.model._meta.pk
         try:
-            for pk in object_pks:
-                validate(pk)
+            if isinstance(pk, models.CompositePrimaryKey):
+                object_pks = self._decode_composite_pks(object_pks)
+                if object_pks is None:
+                    return queryset
+            else:
+                for pk_value in object_pks:
+                    pk.to_python(pk_value)
         except ValidationError:
             # Disable the optimization if the POST data was tampered with.
             return queryset
         return queryset.filter(pk__in=object_pks)
+
+    def _decode_composite_pks(self, values):
+        """
+        Decode quoted composite primary keys from a list of strings (e.g.
+        selected changelist rows) into a list of converted parts. Return None
+        if any value doesn't decode to a valid composite key.
+        """
+        pk = self.opts.pk
+        decoded = []
+        try:
+            for value in values:
+                parts = split_parts(value)
+                if len(parts) != len(pk.fields):
+                    return None
+                decoded.append(
+                    [
+                        (
+                            None
+                            if part in (COMPOSITE_PK_NULL, None)
+                            else field.to_python(unquote(part))
+                        )
+                        for field, part in zip(pk.fields, parts)
+                    ]
+                )
+        except (ValidationError, ValueError):
+            return None
+        return decoded
 
     def _get_formset_with_permissions(self, request, queryset, for_save=False):
         """
@@ -2518,7 +2618,7 @@ class ModelAdmin(BaseModelAdmin):
                 "The field %s cannot be referenced." % to_field
             )
 
-        obj = self.get_object(request, unquote(object_id), to_field)
+        obj = self.get_object(request, self.unquote(object_id, to_field), to_field)
 
         if not self.has_delete_permission(request, obj):
             raise PermissionDenied
@@ -2541,6 +2641,8 @@ class ModelAdmin(BaseModelAdmin):
             obj_display = str(obj)
             attr = str(to_field) if to_field else self.opts.pk.attname
             obj_id = obj.serializable_value(attr)
+            if self.opts.is_composite_pk and not to_field:
+                obj_id = quote(obj_id)
             self.log_deletions(request, [obj])
             self.delete_model(request, obj)
 
@@ -2582,7 +2684,7 @@ class ModelAdmin(BaseModelAdmin):
 
         # First check if the user can see this history.
         model = self.model
-        obj = self.get_object(request, unquote(object_id))
+        obj = self.get_object(request, self.unquote(object_id))
         if obj is None:
             return self._get_obj_does_not_exist_redirect(
                 request, model._meta, object_id
@@ -2595,7 +2697,7 @@ class ModelAdmin(BaseModelAdmin):
         app_label = self.opts.app_label
         action_list = (
             LogEntry.objects.filter(
-                object_id=unquote(object_id),
+                object_id=self.log_object_id(obj),
                 content_type=get_content_type_for_model(model),
             )
             .select_related("user", "content_type")

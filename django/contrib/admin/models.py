@@ -21,6 +21,13 @@ ACTION_FLAG_CHOICES = [
 ]
 
 
+def _object_id(obj):
+    pk = obj._meta.pk
+    if isinstance(pk, models.CompositePrimaryKey):
+        return pk.value_to_string(obj)
+    return obj.pk
+
+
 class LogEntryManager(models.Manager):
     use_in_migrations = True
 
@@ -36,7 +43,7 @@ class LogEntryManager(models.Manager):
                 content_type_id=ContentType.objects.get_for_model(
                     obj, for_concrete_model=False
                 ).id,
-                object_id=obj.pk,
+                object_id=_object_id(obj),
                 object_repr=str(obj)[:200],
                 action_flag=action_flag,
                 change_message=change_message,
@@ -181,7 +188,12 @@ class LogEntry(models.Model):
 
     def get_edited_object(self):
         """Return the edited object represented by this log entry."""
-        return self.content_type.get_object_for_this_type(pk=self.object_id)
+        model = self.content_type.model_class()
+        if model is not None and model._meta.is_composite_pk:
+            pk = tuple(model._meta.pk.to_python(self.object_id))
+        else:
+            pk = self.object_id
+        return self.content_type.get_object_for_this_type(pk=pk)
 
     def get_admin_url(self):
         """
@@ -192,8 +204,18 @@ class LogEntry(models.Model):
                 self.content_type.app_label,
                 self.content_type.model,
             )
+            model = self.content_type.model_class()
+            if model is not None and model._meta.is_composite_pk:
+                # The stored object_id is a JSON array of the string parts.
+                # Quote the parts for the URL, which joins them with commas.
+                try:
+                    object_id = quote(tuple(json.loads(self.object_id)))
+                except (json.JSONDecodeError, TypeError):
+                    return None
+            else:
+                object_id = quote(self.object_id)
             try:
-                return reverse(url_name, args=(quote(self.object_id),))
+                return reverse(url_name, args=(object_id,))
             except NoReverseMatch:
                 pass
         return None

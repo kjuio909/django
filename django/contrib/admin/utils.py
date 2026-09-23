@@ -26,6 +26,15 @@ from django.utils.translation import override as translation_override
 QUOTE_MAP = {i: "_%02X" % i for i in b'":/_#?;@&=+$,"[]<>%\n\\'}
 UNQUOTE_MAP = {v: chr(k) for k, v in QUOTE_MAP.items()}
 UNQUOTE_RE = _lazy_re_compile("_(?:%s)" % "|".join([x[1:] for x in UNQUOTE_MAP]))
+# Separator between the parts of a quoted composite primary key. It is also
+# quoted, so commas that are part of a value (e.g. "a,b" -> "a_2Cb") cannot be
+# confused with the separator.
+COMPOSITE_PK_SEPARATOR = ","
+# Representation of a None part in a quoted composite primary key. "@" is
+# quoted to "_40" when it's part of a value, so the literal token can only
+# appear in a quoted key as the None marker. It also keeps empty strings ("")
+# distinct from None.
+COMPOSITE_PK_NULL = "@"
 
 
 class FieldIsAForeignKeyColumnName(Exception):
@@ -94,13 +103,33 @@ def quote(s):
     any '/', '_' and ':' and similarly problematic characters.
     Similar to urllib.parse.quote(), except that the quoting is slightly
     different so that it doesn't get automatically unquoted by the web browser.
+
+    A composite primary key (a tuple) is encoded as the comma-separated quoted
+    representations of its parts. The comma itself is quoted, so a value that
+    contains one can't be confused with the separator. A None part is encoded
+    as COMPOSITE_PK_NULL ("@").
     """
-    return s.translate(QUOTE_MAP) if isinstance(s, str) else s
+    if isinstance(s, str):
+        return s.translate(QUOTE_MAP)
+    if isinstance(s, (tuple, list)):
+        return COMPOSITE_PK_SEPARATOR.join(
+            COMPOSITE_PK_NULL if part is None else quote(str(part)) for part in s
+        )
+    return s
 
 
 def unquote(s):
-    """Undo the effects of quote()."""
+    """Undo the effects of quote() on a single primary key value."""
     return UNQUOTE_RE.sub(lambda m: UNQUOTE_MAP[m[0]], s)
+
+
+def split_parts(object_id):
+    """
+    Split a quoted composite primary key into its quoted parts. The parts are
+    not unquoted, so use unquote() on each of them. A None part appears as
+    COMPOSITE_PK_NULL and should be passed through unchanged.
+    """
+    return object_id.split(COMPOSITE_PK_SEPARATOR)
 
 
 def flatten(fields):

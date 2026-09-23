@@ -147,6 +147,25 @@ class ModelWithStringPrimaryKey(models.Model):
         return "/dummy/%s/" % self.string_pk
 
 
+class CompositePKModel(models.Model):
+    pk = models.CompositePrimaryKey("foo", "bar")
+    foo = models.CharField(max_length=10)
+    bar = models.CharField(max_length=10)
+    name = models.CharField(max_length=20, blank=True)
+
+    def __str__(self):
+        return f"{self.foo},{self.bar}"
+
+
+class CompositePKIntModel(models.Model):
+    pk = models.CompositePrimaryKey("foo", "num")
+    foo = models.CharField(max_length=10)
+    num = models.SmallIntegerField()
+
+    def __str__(self):
+        return f"{self.foo},{self.num}"
+
+
 class Color(models.Model):
     value = models.CharField(max_length=10)
     warm = models.BooleanField(default=False)

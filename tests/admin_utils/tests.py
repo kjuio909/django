@@ -6,6 +6,7 @@ from django.conf import settings
 from django.contrib import admin
 from django.contrib.admin import helpers
 from django.contrib.admin.utils import (
+    COMPOSITE_PK_NULL,
     NestedObjects,
     build_q_object_from_lookup_parameters,
     display_for_field,
@@ -16,6 +17,8 @@ from django.contrib.admin.utils import (
     label_for_field,
     lookup_field,
     quote,
+    split_parts,
+    unquote,
 )
 from django.contrib.auth.models import User
 from django.contrib.auth.templatetags.auth import render_password_as_hash
@@ -544,6 +547,37 @@ class UtilsTests(SimpleTestCase):
 
     def test_quote(self):
         self.assertEqual(quote("something\nor\nother"), "something_0Aor_0Aother")
+
+    def test_quote_composite_pk(self):
+        cases = [
+            ((1, 2), "1,2"),
+            (("f,o,o", "b-a-r"), "f_2Co_2Co,b-a-r"),
+            (("a/b", "c:d"), "a_2Fb,c_3Ad"),
+            (("héllo", "世界"), "héllo,世界"),
+            (("@", None), "_40,%s" % COMPOSITE_PK_NULL),
+            ((None, ""), "%s," % COMPOSITE_PK_NULL),
+            ((), ""),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(quote(value), expected)
+
+    def test_quote_unquote_composite_pk_roundtrip(self):
+        cases = [
+            ("f,o,o", "b/a-r"),
+            ("héllo", "世界"),
+            ("", "x"),
+            ("@home", "a,b,c"),
+            (None, "z"),
+        ]
+        for parts in cases:
+            with self.subTest(parts=parts):
+                quoted = quote(parts)
+                decoded = tuple(
+                    None if part == COMPOSITE_PK_NULL else unquote(part)
+                    for part in split_parts(quoted)
+                )
+                self.assertEqual(decoded, parts)
 
     def test_build_q_object_from_lookup_parameters(self):
         parameters = {
