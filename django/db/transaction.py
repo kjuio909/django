@@ -1,5 +1,5 @@
 import warnings
-from contextlib import ContextDecorator, contextmanager
+from contextlib import AsyncContextDecorator, ContextDecorator, contextmanager
 
 from asgiref.sync import sync_to_async
 
@@ -336,13 +336,23 @@ def atomic(using=None, savepoint=True, durable=False):
         return Atomic(using, savepoint, durable)
 
 
-class AsyncAtomic:
+class AsyncAtomic(AsyncContextDecorator):
     """
     Asynchronous counterpart of Atomic.
 
-    An instance can only be used as an asynchronous context manager:
+    An instance can be used as an asynchronous context manager::
 
         async with async_atomic():
+            ...
+
+    or as a decorator for an asynchronous function::
+
+        @async_atomic
+        async def view(request):
+            ...
+
+        @async_atomic(using="other")
+        async def other_view(request):
             ...
 
     It cannot be used synchronously with ``with``; doing so raises
@@ -358,6 +368,16 @@ class AsyncAtomic:
 
     def __init__(self, using, savepoint, durable):
         self._atomic = Atomic(using, savepoint, durable)
+
+    def _recreate_cm(self):
+        # Return a fresh block for each call of a decorated function, like
+        # ContextDecorator does. (The underlying Atomic is reentrant and
+        # could be reused, since its state is kept on the connection.)
+        return AsyncAtomic(
+            self._atomic.using,
+            self._atomic.savepoint,
+            self._atomic.durable,
+        )
 
     def __enter__(self):
         raise TypeError(
@@ -383,7 +403,12 @@ class AsyncAtomic:
 
 
 def async_atomic(using=None, savepoint=True, durable=False):
-    # Asynchronous context manager: async with async_atomic(...): ...
+    # Bare decorator: @async_atomic -- although the first argument is called
+    # `using`, it's actually the coroutine function being decorated.
+    if callable(using):
+        return AsyncAtomic(DEFAULT_DB_ALIAS, savepoint, durable)(using)
+    # Decorator: @async_atomic(...) or context manager:
+    # async with async_atomic(...): ...
     return AsyncAtomic(using, savepoint, durable)
 
 

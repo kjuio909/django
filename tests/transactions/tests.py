@@ -1,6 +1,8 @@
+import asyncio
 import sys
 import threading
 import time
+from inspect import iscoroutinefunction
 from unittest import skipIf, skipUnless
 
 from asgiref.sync import async_to_sync
@@ -23,6 +25,12 @@ from django.test import (
 from django.utils.deprecation import RemovedInDjango70Warning
 
 from .models import Reporter, TxnItem
+
+
+@transaction.async_atomic
+async def async_atomic_decorated_create(value):
+    await TxnItem.objects.acreate(value=value)
+    return await TxnItem.objects.acount()
 
 
 @skipUnlessDBFeature("uses_savepoints")
@@ -682,3 +690,112 @@ class AsyncAtomicTests(TransactionTestCase):
         with self.assertRaisesMessage(TypeError, msg):
             with transaction.async_atomic():
                 pass
+
+    async def test_bare_decorator_commits_and_preserves_return_value(self):
+        @transaction.async_atomic
+        async def create_and_count(value):
+            await TxnItem.objects.acreate(value=value)
+            return await TxnItem.objects.acount()
+
+        self.assertTrue(iscoroutinefunction(create_and_count))
+        self.assertEqual(create_and_count.__name__, "create_and_count")
+        self.assertEqual(await create_and_count(1), 1)
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+        self.assertEqual(await create_and_count(2), 2)
+        self.assertEqual(await TxnItem.objects.acount(), 2)
+
+    async def test_called_decorator_without_args_commits(self):
+        @transaction.async_atomic()
+        async def create_and_count(value):
+            await TxnItem.objects.acreate(value=value)
+            return await TxnItem.objects.acount()
+
+        self.assertTrue(iscoroutinefunction(create_and_count))
+        self.assertEqual(await create_and_count(3), 1)
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+
+    async def test_decorator_with_args_on_other_database(self):
+        @transaction.async_atomic(using="other")
+        async def create_and_count(value):
+            await TxnItem.objects.using("other").acreate(value=value)
+            return await TxnItem.objects.using("other").acount()
+
+        self.assertTrue(iscoroutinefunction(create_and_count))
+        self.assertEqual(await create_and_count(4), 1)
+        self.assertEqual(await TxnItem.objects.using("other").acount(), 1)
+        self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
+
+    async def test_decorator_rolls_back_on_value_error(self):
+        @transaction.async_atomic
+        async def failing():
+            await TxnItem.objects.acreate(value=5)
+            raise ValueError("boom")
+
+        with self.assertRaisesMessage(ValueError, "boom"):
+            await failing()
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_decorator_rolls_back_on_cancelled_error(self):
+        @transaction.async_atomic
+        async def cancellable(ready):
+            await TxnItem.objects.acreate(value=6)
+            ready.set()
+            await asyncio.Event().wait()
+
+        ready = asyncio.Event()
+        task = asyncio.ensure_future(cancellable(ready))
+        await ready.wait()
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    @skipUnlessDBFeature("supports_transactions")
+    @async_to_sync
+    async def test_decorator_nested_without_savepoint_doomed(self):
+        @transaction.async_atomic(savepoint=False)
+        async def inner():
+            await TxnItem.objects.acreate(value=20)
+            raise ValueError("inner")
+
+        @transaction.async_atomic
+        async def outer():
+            await TxnItem.objects.acreate(value=10)
+            with self.assertRaisesMessage(ValueError, "inner"):
+                await inner()
+            # The outer transaction is doomed; queries are refused until it
+            # rolls back.
+            with self.assertRaises(transaction.TransactionManagementError):
+                await TxnItem.objects.acreate(value=12)
+
+        await outer()
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_decorator_durable_nested_raises_runtime_error(self):
+        @transaction.async_atomic(durable=True)
+        async def durable_block():
+            await TxnItem.objects.acreate(value=30)
+            raise AssertionError("body must not execute")
+
+        @transaction.async_atomic
+        async def outer():
+            msg = (
+                "A durable atomic block cannot be nested within another "
+                "atomic block."
+            )
+            with self.assertRaisesMessage(RuntimeError, msg):
+                await durable_block()
+
+        await outer()
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_decorator_called_with_await(self):
+        result = await async_atomic_decorated_create(7)
+        self.assertEqual(result, 1)
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+
+    def test_decorator_called_with_async_to_sync(self):
+        result = async_to_sync(async_atomic_decorated_create)(7)
+        self.assertEqual(result, 1)
+        self.assertEqual(TxnItem.objects.count(), 1)
