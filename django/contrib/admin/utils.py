@@ -94,13 +94,32 @@ def quote(s):
     any '/', '_' and ':' and similarly problematic characters.
     Similar to urllib.parse.quote(), except that the quoting is slightly
     different so that it doesn't get automatically unquoted by the web browser.
+
+    The components of a composite primary key are quoted individually and
+    joined with commas. Since commas in quoted strings are escaped, a raw
+    comma unambiguously separates the key's components.
     """
+    if isinstance(s, (tuple, list)):
+        return ",".join(str(quote(part)) for part in s)
     return s.translate(QUOTE_MAP) if isinstance(s, str) else s
 
 
 def unquote(s):
     """Undo the effects of quote()."""
     return UNQUOTE_RE.sub(lambda m: UNQUOTE_MAP[m[0]], s)
+
+
+def unquote_pk(value, pk_field):
+    """
+    Undo quote() for an object_id, splitting a composite primary key into its
+    (still scalar-unquoted) components. Scalar primary keys are returned with
+    only the URL quoting removed.
+    """
+    if isinstance(pk_field, models.CompositePrimaryKey):
+        # Literal commas inside quoted components are escaped as _2C, so a raw
+        # comma can only separate the key's components.
+        return [unquote(part) for part in value.split(",")]
+    return unquote(value)
 
 
 def flatten(fields):

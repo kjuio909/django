@@ -35,6 +35,7 @@ from django.contrib.admin.utils import (
     model_ngettext,
     quote,
     unquote,
+    unquote_pk,
 )
 from django.contrib.admin.widgets import AutocompleteSelect, AutocompleteSelectMultiple
 from django.contrib.auth import get_permission_codename
@@ -955,6 +956,12 @@ class ModelAdmin(BaseModelAdmin):
             self.search_help_text,
         )
 
+    def _unquote_object_id(self, object_id, from_field=None):
+        """Decode a quoted object_id from a URL into a lookup value."""
+        if from_field is None and self.model._meta.is_composite_pk:
+            return unquote_pk(object_id, self.model._meta.pk)
+        return unquote(object_id)
+
     def get_object(self, request, object_id, from_field=None):
         """
         Return an instance matching the field and value provided, the primary
@@ -969,7 +976,10 @@ class ModelAdmin(BaseModelAdmin):
         try:
             object_id = field.to_python(object_id)
             return queryset.get(**{field.name: object_id})
-        except (model.DoesNotExist, ValidationError, ValueError):
+        except (model.DoesNotExist, ValidationError, ValueError, TypeError):
+            # A missing object or a malformed key (wrong number of components,
+            # bad JSON, or a failed component conversion) resolves to no
+            # object.
             return None
 
     def get_changelist_form(self, request, **kwargs):
@@ -1074,7 +1084,7 @@ class ModelAdmin(BaseModelAdmin):
             ),
         }
         checkbox = forms.CheckboxInput(attrs, lambda value: False)
-        return checkbox.render(helpers.ACTION_CHECKBOX_NAME, str(obj.pk))
+        return checkbox.render(helpers.ACTION_CHECKBOX_NAME, quote(obj.pk))
 
     @staticmethod
     def _get_action_description(func, name):
@@ -1904,7 +1914,7 @@ class ModelAdmin(BaseModelAdmin):
 
             if not select_across:
                 # Perform the action only on the selected objects
-                queryset = queryset.filter(pk__in=selected)
+                queryset = queryset.filter(pk__in=self._lookup_pks(selected))
 
             response = func(self, request, queryset)
 
@@ -2049,9 +2059,16 @@ class ModelAdmin(BaseModelAdmin):
         Create a message informing the user that the object doesn't exist
         and return a redirect to the admin index page.
         """
+        key = (
+            unquote_pk(object_id, opts.pk)
+            if opts.is_composite_pk
+            else unquote(object_id)
+        )
+        if isinstance(key, list):
+            key = ", ".join(str(part) for part in key)
         msg = _("%(name)s with ID “%(key)s” doesn’t exist. Perhaps it was deleted?") % {
             "name": opts.verbose_name,
-            "key": unquote(object_id),
+            "key": key,
         }
         self.message_user(request, msg, messages.WARNING)
         url = reverse("admin:index", current_app=self.admin_site.name)
@@ -2083,7 +2100,9 @@ class ModelAdmin(BaseModelAdmin):
             obj = None
 
         else:
-            obj = self.get_object(request, unquote(object_id), to_field)
+            obj = self.get_object(
+                request, self._unquote_object_id(object_id, to_field), to_field
+            )
             if not self.has_view_or_change_permission(request, obj):
                 raise PermissionDenied
 
@@ -2125,7 +2144,7 @@ class ModelAdmin(BaseModelAdmin):
                 and "_addanother" not in request.POST
             ):
                 selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
-                if len(selected) != 1 or selected[0] != str(obj.pk):
+                if len(selected) != 1 or selected[0] != str(quote(obj.pk)):
                     raise BadRequest
                 queryset = self.get_queryset(request)
                 if response := self.response_action(
@@ -2250,6 +2269,27 @@ class ModelAdmin(BaseModelAdmin):
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
         return self.changeform_view(request, object_id, form_url, extra_context)
+
+    def _lookup_pks(self, quoted_pks):
+        """
+        Decode primary keys submitted in the request (e.g. action
+        checkboxes) into values suitable for a ``pk__in`` lookup.
+
+        Scalar primary keys are returned with only the admin URL quoting
+        removed. Composite primary keys are converted into tuples of typed
+        component values; malformed entries are skipped as they can never
+        match an object.
+        """
+        if not self.model._meta.is_composite_pk:
+            return [unquote(value) for value in quoted_pks]
+        pk_field = self.model._meta.pk
+        pks = []
+        for value in quoted_pks:
+            try:
+                pks.append(tuple(pk_field.to_python(unquote_pk(value, pk_field))))
+            except (ValueError, TypeError):
+                continue
+        return pks
 
     def _get_edited_object_pks(self, request, prefix):
         """Return POST data values of list_editable primary keys."""
@@ -2518,7 +2558,9 @@ class ModelAdmin(BaseModelAdmin):
                 "The field %s cannot be referenced." % to_field
             )
 
-        obj = self.get_object(request, unquote(object_id), to_field)
+        obj = self.get_object(
+            request, self._unquote_object_id(object_id, to_field), to_field
+        )
 
         if not self.has_delete_permission(request, obj):
             raise PermissionDenied
@@ -2582,7 +2624,7 @@ class ModelAdmin(BaseModelAdmin):
 
         # First check if the user can see this history.
         model = self.model
-        obj = self.get_object(request, unquote(object_id))
+        obj = self.get_object(request, self._unquote_object_id(object_id))
         if obj is None:
             return self._get_obj_does_not_exist_redirect(
                 request, model._meta, object_id
@@ -2593,9 +2635,15 @@ class ModelAdmin(BaseModelAdmin):
 
         # Then get the history for this object.
         app_label = self.opts.app_label
+        if self.opts.is_composite_pk:
+            # LogEntry.object_id stores the composite key serialized as JSON
+            # (see LogEntryManager.log_actions).
+            object_id = self.opts.pk.value_to_string(obj)
+        else:
+            object_id = str(obj.pk)
         action_list = (
             LogEntry.objects.filter(
-                object_id=unquote(object_id),
+                object_id=object_id,
                 content_type=get_content_type_for_model(model),
             )
             .select_related("user", "content_type")

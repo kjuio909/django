@@ -148,10 +148,11 @@ class CompositePrimaryKey(Field):
     def to_python(self, value):
         if isinstance(value, str):
             # Assume we're deserializing.
-            vals = json.loads(value)
+            value = json.loads(value)
+        if isinstance(value, (list, tuple)):
             value = [
                 field.to_python(val)
-                for field, val in zip(self.fields, vals, strict=True)
+                for field, val in zip(self.fields, value, strict=True)
             ]
         return value
 

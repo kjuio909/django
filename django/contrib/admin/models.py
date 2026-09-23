@@ -36,7 +36,11 @@ class LogEntryManager(models.Manager):
                 content_type_id=ContentType.objects.get_for_model(
                     obj, for_concrete_model=False
                 ).id,
-                object_id=obj.pk,
+                object_id=(
+                    obj._meta.pk.value_to_string(obj)
+                    if obj._meta.is_composite_pk
+                    else obj.pk
+                ),
                 object_repr=str(obj)[:200],
                 action_flag=action_flag,
                 change_message=change_message,
@@ -181,6 +185,10 @@ class LogEntry(models.Model):
 
     def get_edited_object(self):
         """Return the edited object represented by this log entry."""
+        model = self.content_type.model_class()
+        if model is not None and model._meta.is_composite_pk:
+            object_id = model._meta.pk.to_python(self.object_id)
+            return model._base_manager.get(pk=object_id)
         return self.content_type.get_object_for_this_type(pk=self.object_id)
 
     def get_admin_url(self):
@@ -192,8 +200,16 @@ class LogEntry(models.Model):
                 self.content_type.app_label,
                 self.content_type.model,
             )
+            model = self.content_type.model_class()
             try:
-                return reverse(url_name, args=(quote(self.object_id),))
+                if model is not None and model._meta.is_composite_pk:
+                    object_id = quote(tuple(model._meta.pk.to_python(self.object_id)))
+                else:
+                    object_id = quote(self.object_id)
+                return reverse(url_name, args=(object_id,))
             except NoReverseMatch:
+                pass
+            except (ValueError, TypeError):
+                # A malformed composite key cannot resolve to an object.
                 pass
         return None

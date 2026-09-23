@@ -60,10 +60,16 @@ A composite primary key can also be filtered by a ``tuple``:
     1
 
 We're still working on composite primary key support for
-:ref:`relational fields <cpk-and-relations>`, including
-:class:`.GenericForeignKey` fields, and the Django admin. Models with composite
-primary keys cannot be registered in the Django admin at this time. You can
-expect to see this in future releases.
+:ref:`relational fields <cpk-and-relations>` and
+:class:`.GenericForeignKey` fields.
+
+The Django admin
+----------------
+
+Models with composite primary keys can be registered in the Django admin.
+Each component of the key is quoted individually and the components are joined
+with commas in admin URLs, so values containing slashes, commas, Unicode or
+other special characters remain unambiguous.
 
 Migrating to a composite primary key
 ====================================

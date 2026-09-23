@@ -93,12 +93,11 @@ class TestRegistration(SimpleTestCase):
             self.site.register(Location)
 
     def test_composite_pk_model(self):
-        msg = (
-            "The model Guest has a composite primary key, so it cannot be registered "
-            "with admin."
-        )
-        with self.assertRaisesMessage(ImproperlyConfigured, msg):
-            self.site.register(Guest)
+        # Models with a composite primary key can be registered with the
+        # admin.
+        self.site.register(Guest)
+        self.assertIsInstance(self.site.get_model_admin(Guest), admin.ModelAdmin)
+        self.site.unregister(Guest)
 
     def test_is_registered_model(self):
         "Checks for registered models should return true."

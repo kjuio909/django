@@ -44,6 +44,9 @@ from .models import (
     CamelCaseRelatedModel,
     Category,
     Chapter,
+    CompositePKFKModel,
+    CompositePKModel,
+    CompositePKParentModel,
     ChapterXtra1,
     Child,
     ChildOfReferer,
@@ -1308,8 +1311,22 @@ class OverriddenActionAdmin(admin.ModelAdmin):
         pass
 
 
+@admin.action(description="Show key", location=ActionLocation.CHANGE_FORM)
+def show_composite_key(modeladmin, request, queryset):
+    return HttpResponse(str(queryset.get().pk))
+
+
+class CompositePKModelAdmin(admin.ModelAdmin):
+    list_display = ("name", "num", "text")
+    search_fields = ("name",)
+    actions = ["delete_selected", show_composite_key]
+
+
 site = admin.AdminSite(name="admin")
 site.site_url = "/my-site-url/"
+site.register(CompositePKModel, CompositePKModelAdmin)
+site.register(CompositePKFKModel)
+site.register(CompositePKParentModel)
 site.register(Article, ArticleAdmin)
 site.register(CustomArticle, CustomArticleAdmin)
 site.register(

@@ -1209,3 +1209,24 @@ class CamelCaseRelatedModel(models.Model):
 # RemovedInDjango70Warning: When the deprecation ends, remove.
 class ModelAction(models.Model):
     pass
+
+
+class CompositePKParentModel(models.Model):
+    name = models.CharField(max_length=100)
+
+
+class CompositePKModel(models.Model):
+    pk = models.CompositePrimaryKey("name", "num")
+    name = models.CharField(max_length=50)
+    num = models.IntegerField()
+    text = models.CharField(max_length=100, blank=True)
+
+    def __str__(self):
+        return f"{self.name}/{self.num}"
+
+
+class CompositePKFKModel(models.Model):
+    pk = models.CompositePrimaryKey("parent_id", "code")
+    parent = models.ForeignKey(CompositePKParentModel, on_delete=models.CASCADE)
+    code = models.CharField(max_length=50)
+    label = models.CharField(max_length=100, blank=True)
