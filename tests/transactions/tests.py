@@ -3,6 +3,8 @@ import threading
 import time
 from unittest import skipIf, skipUnless
 
+from asgiref.sync import async_to_sync
+
 from django.db import (
     DatabaseError,
     Error,
@@ -20,7 +22,7 @@ from django.test import (
 )
 from django.utils.deprecation import RemovedInDjango70Warning
 
-from .models import Reporter
+from .models import Reporter, TxnItem
 
 
 @skipUnlessDBFeature("uses_savepoints")
@@ -598,3 +600,98 @@ class SavepointTests(SimpleTestCase):
         msg = "savepoint() is deprecated. Use savepoint_create() instead."
         with self.assertRaisesMessage(RemovedInDjango70Warning, msg):
             transaction.savepoint()
+
+
+class AsyncAtomicTests(TransactionTestCase):
+    available_apps = ["transactions"]
+    databases = {"default", "other"}
+
+    def setUp(self):
+        TxnItem.objects.using("default").all().delete()
+        TxnItem.objects.using("other").all().delete()
+
+    def test_cannot_use_synchronous_with(self):
+        msg = (
+            "async_atomic() can only be used as an asynchronous context "
+            "manager"
+        )
+        with self.assertRaisesMessage(TypeError, msg):
+            with transaction.async_atomic():
+                pass
+
+    async def test_commit_on_normal_exit(self):
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=1)
+            self.assertEqual(await TxnItem.objects.acount(), 1)
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+
+    async def test_rollback_on_value_error_and_reraise(self):
+        with self.assertRaisesMessage(ValueError, "boom"):
+            async with transaction.async_atomic():
+                await TxnItem.objects.acreate(value=1)
+                raise ValueError("boom")
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_delete_commits(self):
+        await TxnItem.objects.acreate(value=1)
+        async with transaction.async_atomic():
+            count, _ = await TxnItem.objects.all().adelete()
+            self.assertEqual(count, 1)
+            self.assertEqual(await TxnItem.objects.acount(), 0)
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    @skipUnlessDBFeature("uses_savepoints")
+    @async_to_sync
+    async def test_nested_savepoint_inner_rollback_outer_commits(self):
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=1)
+            try:
+                async with transaction.async_atomic(savepoint=True):
+                    await TxnItem.objects.acreate(value=2)
+                    raise ValueError("inner boom")
+            except ValueError:
+                pass
+            # The inner write was rolled back to the savepoint.
+            self.assertEqual(await TxnItem.objects.acount(), 1)
+            await TxnItem.objects.acreate(value=3)
+        # The outer transaction committed.
+        values = [item.value async for item in TxnItem.objects.all()]
+        self.assertEqual(sorted(values), [1, 3])
+
+    @skipUnlessDBFeature("uses_savepoints")
+    @async_to_sync
+    async def test_nested_without_savepoint_rolls_back_everything(self):
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=1)
+            try:
+                async with transaction.async_atomic(savepoint=False):
+                    await TxnItem.objects.acreate(value=2)
+                    raise ValueError("inner boom")
+            except ValueError:
+                pass
+        # Even though the exception was caught, the outer transaction was
+        # marked for rollback, so none of the writes are committed.
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_nested_durable_raises_before_body(self):
+        async with transaction.async_atomic():
+            msg = (
+                "A durable atomic block cannot be nested within another "
+                "atomic block."
+            )
+            with self.assertRaisesMessage(RuntimeError, msg):
+                async with transaction.async_atomic(durable=True):
+                    await TxnItem.objects.acreate(value=9)
+            await TxnItem.objects.acreate(value=1)
+        # The durable block's body never executed; the outer block committed.
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+
+    async def test_explicit_using_other(self):
+        async with transaction.async_atomic(using="other"):
+            await TxnItem.objects.using("other").acreate(value=1)
+            self.assertEqual(
+                await TxnItem.objects.using("other").acount(), 1
+            )
+            self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
+        self.assertEqual(await TxnItem.objects.using("other").acount(), 1)
+        self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
