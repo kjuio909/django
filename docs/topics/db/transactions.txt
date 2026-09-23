@@ -250,6 +250,30 @@ Django provides a single API to control database transactions.
     is especially important if you're using :func:`atomic` in long-running
     processes, outside of Django's request / response cycle.
 
+.. function:: async_atomic(using=None, savepoint=True, durable=False)
+
+    .. versionadded:: 6.1
+
+    Asynchronous counterpart of :func:`atomic`. It can only be used as an
+    asynchronous context manager::
+
+        async def view(request):
+            async with transaction.async_atomic():
+                await MyModel.objects.acreate(...)
+                ...
+
+    It has the same semantics as :func:`atomic`: it commits on normal exit
+    and rolls back when an exception propagates out of the block, it supports
+    nested blocks with savepoints, and nesting a ``durable`` block raises
+    ``RuntimeError``. Unlike :func:`atomic`, it cannot be used as a decorator
+    or with a synchronous ``with`` statement; doing the latter raises
+    ``TypeError``.
+
+    The block shares its database connection with the asynchronous ORM
+    queries executed inside it, so ``acreate()``, ``adelete()``,
+    ``acount()`` and other asynchronous queryset methods participate in the
+    transaction.
+
 Autocommit
 ==========
 

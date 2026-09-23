@@ -1,6 +1,8 @@
 import warnings
 from contextlib import ContextDecorator, contextmanager
 
+from asgiref.sync import sync_to_async
+
 from django.db import (
     DEFAULT_DB_ALIAS,
     DatabaseError,
@@ -332,6 +334,57 @@ def atomic(using=None, savepoint=True, durable=False):
     # Decorator: @atomic(...) or context manager: with atomic(...): ...
     else:
         return Atomic(using, savepoint, durable)
+
+
+class AsyncAtomic:
+    """
+    Asynchronous counterpart of Atomic.
+
+    An instance can only be used as an asynchronous context manager:
+
+        async with async_atomic():
+            ...
+
+    It cannot be used synchronously with ``with``; doing so raises
+    TypeError. The transaction bookkeeping is delegated to a synchronous
+    Atomic block whose __enter__/__exit__ run through sync_to_async with
+    thread-sensitive execution. Since the asynchronous ORM also executes its
+    queries through thread-sensitive sync_to_async calls, entering the block,
+    running the enclosed queries, and exiting the block all happen on the
+    same thread and therefore share the same database connection.
+
+    This is a private API.
+    """
+
+    def __init__(self, using, savepoint, durable):
+        self._atomic = Atomic(using, savepoint, durable)
+
+    def __enter__(self):
+        raise TypeError(
+            "async_atomic() can only be used as an asynchronous context "
+            "manager with 'async with'."
+        )
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # __enter__ raises, but implement __exit__ for completeness.
+        raise TypeError(
+            "async_atomic() can only be used as an asynchronous context "
+            "manager with 'async with'."
+        )
+
+    async def __aenter__(self):
+        await sync_to_async(self._atomic.__enter__, thread_sensitive=True)()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await sync_to_async(self._atomic.__exit__, thread_sensitive=True)(
+            exc_type, exc_value, traceback
+        )
+
+
+def async_atomic(using=None, savepoint=True, durable=False):
+    # Asynchronous context manager: async with async_atomic(...): ...
+    return AsyncAtomic(using, savepoint, durable)
 
 
 def _non_atomic_requests(view, using):

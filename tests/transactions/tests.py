@@ -3,6 +3,8 @@ import threading
 import time
 from unittest import skipIf, skipUnless
 
+from asgiref.sync import async_to_sync
+
 from django.db import (
     DatabaseError,
     Error,
@@ -20,7 +22,7 @@ from django.test import (
 )
 from django.utils.deprecation import RemovedInDjango70Warning
 
-from .models import Reporter
+from .models import Reporter, TxnItem
 
 
 @skipUnlessDBFeature("uses_savepoints")
@@ -598,3 +600,85 @@ class SavepointTests(SimpleTestCase):
         msg = "savepoint() is deprecated. Use savepoint_create() instead."
         with self.assertRaisesMessage(RemovedInDjango70Warning, msg):
             transaction.savepoint()
+
+
+class AsyncAtomicTests(TransactionTestCase):
+    available_apps = ["transactions"]
+    databases = {"default", "other"}
+
+    async def test_commit_on_normal_exit(self):
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=1)
+            self.assertEqual(await TxnItem.objects.acount(), 1)
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+        async with transaction.async_atomic():
+            deleted, _ = await TxnItem.objects.all().adelete()
+            self.assertEqual(deleted, 1)
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_rollback_on_exception_and_reraise(self):
+        with self.assertRaisesMessage(ValueError, "boom"):
+            async with transaction.async_atomic():
+                await TxnItem.objects.acreate(value=2)
+                raise ValueError("boom")
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_nested_savepoint_rolls_back_inner_only(self):
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=10)
+            with self.assertRaisesMessage(ValueError, "inner"):
+                async with transaction.async_atomic(savepoint=True):
+                    await TxnItem.objects.acreate(value=11)
+                    raise ValueError("inner")
+            self.assertEqual(await TxnItem.objects.acount(), 1)
+            await TxnItem.objects.acreate(value=12)
+        values = {item.value async for item in TxnItem.objects.all()}
+        self.assertEqual(values, {10, 12})
+
+    @skipUnlessDBFeature("supports_transactions")
+    @async_to_sync
+    async def test_nested_without_savepoint_doomed_to_rollback(self):
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=20)
+            with self.assertRaisesMessage(ValueError, "inner"):
+                async with transaction.async_atomic(savepoint=False):
+                    await TxnItem.objects.acreate(value=21)
+                    raise ValueError("inner")
+            # No savepoint: the whole outer transaction is doomed, and
+            # queries are refused until it rolls back.
+            with self.assertRaises(transaction.TransactionManagementError):
+                await TxnItem.objects.acreate(value=22)
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_nested_durable_raises_before_body_runs(self):
+        msg = "A durable atomic block cannot be nested within another atomic block."
+        async with transaction.async_atomic():
+            with self.assertRaisesMessage(RuntimeError, msg):
+                async with transaction.async_atomic(durable=True):
+                    raise AssertionError("body must not execute")
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_using_other_isolates_writes(self):
+        async with transaction.async_atomic(using="other"):
+            await TxnItem.objects.using("other").acreate(value=99)
+            self.assertEqual(await TxnItem.objects.using("other").acount(), 1)
+            self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
+        self.assertEqual(await TxnItem.objects.using("other").acount(), 1)
+        self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
+
+    async def test_rollback_on_other_leaves_default_untouched(self):
+        with self.assertRaises(ValueError):
+            async with transaction.async_atomic(using="other"):
+                await TxnItem.objects.using("other").acreate(value=7)
+                raise ValueError
+        self.assertEqual(await TxnItem.objects.using("other").acount(), 0)
+        self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
+
+    def test_sync_with_raises_typeerror(self):
+        msg = (
+            "async_atomic() can only be used as an asynchronous context "
+            "manager with 'async with'."
+        )
+        with self.assertRaisesMessage(TypeError, msg):
+            with transaction.async_atomic():
+                pass
