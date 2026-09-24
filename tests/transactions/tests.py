@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import threading
 import time
@@ -682,3 +683,102 @@ class AsyncAtomicTests(TransactionTestCase):
         with self.assertRaisesMessage(TypeError, msg):
             with transaction.async_atomic():
                 pass
+
+
+class AsyncAtomicDecoratorTests(TransactionTestCase):
+    available_apps = ["transactions"]
+    databases = {"default", "other"}
+
+    async def test_bare_decorator_commits_and_preserves_return_value(self):
+        @transaction.async_atomic
+        async def write():
+            await TxnItem.objects.acreate(value=1)
+            return "done"
+
+        self.assertEqual(await write(), "done")
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+
+    async def test_decorator_with_parentheses(self):
+        @transaction.async_atomic()
+        async def write():
+            await TxnItem.objects.acreate(value=1)
+            return 42
+
+        self.assertEqual(await write(), 42)
+        self.assertEqual(await TxnItem.objects.acount(), 1)
+
+    async def test_decorator_rollback_on_exception_and_reraise(self):
+        @transaction.async_atomic()
+        async def write():
+            await TxnItem.objects.acreate(value=2)
+            raise ValueError("boom")
+
+        with self.assertRaisesMessage(ValueError, "boom"):
+            await write()
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_decorator_rollback_on_cancelled_error_and_reraise(self):
+        @transaction.async_atomic()
+        async def write():
+            await TxnItem.objects.acreate(value=3)
+            raise asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            await write()
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    @skipUnlessDBFeature("supports_transactions")
+    @async_to_sync
+    async def test_decorator_nested_without_savepoint_doomed_to_rollback(self):
+        @transaction.async_atomic(savepoint=False)
+        async def write_inner():
+            await TxnItem.objects.acreate(value=20)
+            raise ValueError("inner")
+
+        async with transaction.async_atomic():
+            await TxnItem.objects.acreate(value=10)
+            with self.assertRaisesMessage(ValueError, "inner"):
+                await write_inner()
+            # No savepoint: the whole outer transaction is doomed, and
+            # queries are refused until it rolls back.
+            with self.assertRaises(transaction.TransactionManagementError):
+                await TxnItem.objects.acreate(value=12)
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_decorator_nested_durable_raises_before_body_runs(self):
+        msg = "A durable atomic block cannot be nested within another atomic block."
+        body_ran = False
+
+        @transaction.async_atomic(durable=True)
+        async def write():
+            nonlocal body_ran
+            body_ran = True
+            await TxnItem.objects.acreate(value=1)
+
+        async with transaction.async_atomic():
+            with self.assertRaisesMessage(RuntimeError, msg):
+                await write()
+        self.assertIs(body_ran, False)
+        self.assertEqual(await TxnItem.objects.acount(), 0)
+
+    async def test_decorator_using_other_isolates_writes(self):
+        @transaction.async_atomic(using="other")
+        async def write():
+            await TxnItem.objects.using("other").acreate(value=99)
+
+        await write()
+        self.assertEqual(await TxnItem.objects.using("other").acount(), 1)
+        self.assertEqual(await TxnItem.objects.using("default").acount(), 0)
+
+    def test_decorator_consistent_between_await_and_async_to_sync(self):
+        @transaction.async_atomic
+        async def write(value):
+            await TxnItem.objects.acreate(value=value)
+            return value
+
+        async def main():
+            return await write(1)
+
+        self.assertEqual(async_to_sync(main)(), 1)
+        self.assertEqual(async_to_sync(write)(2), 2)
+        self.assertEqual(TxnItem.objects.count(), 2)

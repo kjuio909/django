@@ -1,5 +1,6 @@
 import warnings
 from contextlib import ContextDecorator, contextmanager
+from functools import wraps
 
 from asgiref.sync import sync_to_async
 
@@ -340,10 +341,20 @@ class AsyncAtomic:
     """
     Asynchronous counterpart of Atomic.
 
-    An instance can only be used as an asynchronous context manager:
+    An instance can be used as an asynchronous context manager:
 
         async with async_atomic():
             ...
+
+    or as a decorator of an asynchronous function:
+
+        @async_atomic()
+        async def view(...):
+            ...
+
+    When it's used as a decorator, __call__ wraps the execution of the
+    decorated coroutine function in the instance itself, used as an
+    asynchronous context manager.
 
     It cannot be used synchronously with ``with``; doing so raises
     TypeError. The transaction bookkeeping is delegated to a synchronous
@@ -358,6 +369,14 @@ class AsyncAtomic:
 
     def __init__(self, using, savepoint, durable):
         self._atomic = Atomic(using, savepoint, durable)
+
+    def __call__(self, func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            async with self:
+                return await func(*args, **kwargs)
+
+        return wrapper
 
     def __enter__(self):
         raise TypeError(
@@ -383,7 +402,12 @@ class AsyncAtomic:
 
 
 def async_atomic(using=None, savepoint=True, durable=False):
-    # Asynchronous context manager: async with async_atomic(...): ...
+    # Bare decorator: @async_atomic -- although the first argument is called
+    # `using`, it's actually the function being decorated.
+    if callable(using):
+        return AsyncAtomic(DEFAULT_DB_ALIAS, savepoint, durable)(using)
+    # Decorator: @async_atomic(...) or asynchronous context manager:
+    # async with async_atomic(...): ...
     return AsyncAtomic(using, savepoint, durable)
 
 
