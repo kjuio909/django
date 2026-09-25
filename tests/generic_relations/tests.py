@@ -1,3 +1,5 @@
+import json
+
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import FieldError, FieldFetchBlocked
@@ -10,6 +12,8 @@ from .models import (
     Animal,
     Carrot,
     Comparison,
+    CompositePKProduct,
+    CompositeTaggedItem,
     ConcreteRelatedModel,
     ForConcreteModelModel,
     ForProxyModelModel,
@@ -931,3 +935,333 @@ class TestInitWithNoneArgument(SimpleTestCase):
         # TaggedItem requires a content_type but initializing with None should
         # be allowed.
         TaggedItem(content_object=None)
+
+
+class CompositePKGenericRelationsTests(TestCase):
+    """GenericForeignKey targets using a CompositePrimaryKey."""
+
+    @classmethod
+    def setUpTestData(cls):
+        # product_a and product_b share only the tenant_id component;
+        # product_c shares only the sku component with product_a.
+        cls.product_a = CompositePKProduct.objects.create(
+            tenant_id=1, sku="shared", name="first"
+        )
+        cls.product_b = CompositePKProduct.objects.create(
+            tenant_id=1, sku="other", name="second"
+        )
+        cls.product_c = CompositePKProduct.objects.create(
+            tenant_id=2, sku="shared", name="third"
+        )
+        cls.ct = ContentType.objects.get_for_model(CompositePKProduct)
+
+    def test_object_id_stored_as_json_array(self):
+        tag = CompositeTaggedItem.objects.create(
+            tag="json", content_object=self.product_a
+        )
+        tag.refresh_from_db()
+        # Components are stored in primary key declaration order, each
+        # converted by its field's to_python().
+        self.assertEqual(tag.object_id, '[1, "shared"]')
+        self.assertEqual(json.loads(tag.object_id), [1, "shared"])
+
+    def test_int_and_numeric_string_components_are_distinct(self):
+        product = CompositePKProduct.objects.create(
+            tenant_id=1, sku="1", name="numeric sku"
+        )
+        tag = CompositeTaggedItem.objects.create(tag="num", content_object=product)
+        tag.refresh_from_db()
+        stored = json.loads(tag.object_id)
+        self.assertEqual(stored, [1, "1"])
+        self.assertIs(type(stored[0]), int)
+        self.assertIs(type(stored[1]), str)
+        self.assertEqual(tag.content_object, product)
+        self.assertEqual(tag.content_object.pk, (1, "1"))
+
+    def test_save_refresh_read(self):
+        tag_a = CompositeTaggedItem.objects.create(
+            tag="a", content_object=self.product_a
+        )
+        tag_b = CompositeTaggedItem.objects.create(
+            tag="b", content_object=self.product_b
+        )
+        tag_a.refresh_from_db()
+        tag_b.refresh_from_db()
+        # Cross-references sharing one component don't get mixed up.
+        self.assertEqual(tag_a.content_object, self.product_a)
+        self.assertEqual(tag_b.content_object, self.product_b)
+        self.assertEqual(tag_a.content_object.pk, (1, "shared"))
+        self.assertEqual(tag_b.content_object.pk, (1, "other"))
+
+    def test_prefetch(self):
+        CompositeTaggedItem.objects.create(tag="a", content_object=self.product_a)
+        CompositeTaggedItem.objects.create(tag="b", content_object=self.product_b)
+        CompositeTaggedItem.objects.create(tag="c", content_object=self.product_c)
+        with self.assertNumQueries(2):
+            tags = list(
+                CompositeTaggedItem.objects.prefetch_related("content_object")
+            )
+        with self.assertNumQueries(0):
+            objects = [tag.content_object for tag in tags]
+        self.assertEqual(
+            objects, [self.product_a, self.product_b, self.product_c]
+        )
+
+    def test_prefetch_with_custom_queryset(self):
+        CompositeTaggedItem.objects.create(tag="a", content_object=self.product_a)
+        CompositeTaggedItem.objects.create(tag="b", content_object=self.product_b)
+        queryset = CompositePKProduct.objects.filter(tenant_id=1, sku="other")
+        with self.assertNumQueries(2):
+            tags = list(
+                CompositeTaggedItem.objects.prefetch_related(
+                    GenericPrefetch("content_object", [queryset])
+                )
+            )
+        with self.assertNumQueries(0):
+            objects = [tag.content_object for tag in tags]
+        # product_a isn't part of the custom queryset.
+        self.assertEqual(objects, [None, self.product_b])
+
+    def test_reassign(self):
+        tag = CompositeTaggedItem.objects.create(
+            tag="re", content_object=self.product_a
+        )
+        tag.content_object = self.product_b
+        self.assertEqual(tag.content_object, self.product_b)
+        tag.save()
+        tag.refresh_from_db()
+        self.assertEqual(tag.object_id, '[1, "other"]')
+        self.assertEqual(tag.content_object, self.product_b)
+
+    def test_special_character_components_roundtrip(self):
+        skus = [
+            "",
+            "None",
+            "@",
+            "a/b",
+            "a,b",
+            "café-☃-中文",
+            '"quoted"',
+            "back\\slash",
+            "[1, 2]",
+            "  spaces  ",
+        ]
+        for i, sku in enumerate(skus):
+            with self.subTest(sku=sku):
+                product = CompositePKProduct.objects.create(
+                    tenant_id=100 + i, sku=sku, name="special"
+                )
+                tag = CompositeTaggedItem.objects.create(
+                    tag="s%d" % i, content_object=product
+                )
+                tag.refresh_from_db()
+                self.assertEqual(json.loads(tag.object_id), [100 + i, sku])
+                self.assertEqual(tag.content_object, product)
+                self.assertEqual(tag.content_object.pk, (100 + i, sku))
+
+    def test_empty_string_component_is_not_missing_component(self):
+        product = CompositePKProduct.objects.create(
+            tenant_id=5, sku="", name="empty sku"
+        )
+        tag = CompositeTaggedItem.objects.create(tag="e", content_object=product)
+        tag.refresh_from_db()
+        stored = json.loads(tag.object_id)
+        self.assertEqual(stored, [5, ""])
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(tag.content_object, product)
+
+    def test_string_none_component_is_not_null(self):
+        product = CompositePKProduct.objects.create(
+            tenant_id=6, sku="None", name="string none"
+        )
+        tag = CompositeTaggedItem.objects.create(tag="n", content_object=product)
+        tag.refresh_from_db()
+        self.assertIn('"None"', tag.object_id)
+        self.assertNotIn("null", tag.object_id)
+        self.assertEqual(tag.content_object, product)
+
+    def test_none_assignment_clears_content_type(self):
+        tag = CompositeTaggedItem.objects.create(
+            tag="none", content_object=self.product_a
+        )
+        tag.content_object = None
+        self.assertIsNone(tag.content_type)
+        self.assertIsNone(tag.object_id)
+        self.assertIsNone(tag.content_object)
+        tag.save()
+        tag.refresh_from_db()
+        self.assertIsNone(tag.content_type_id)
+        self.assertIsNone(tag.content_object)
+
+    def test_nonexistent_target_returns_none(self):
+        tag = CompositeTaggedItem.objects.create(
+            tag="x", content_object=self.product_a
+        )
+        other = CompositeTaggedItem.objects.create(
+            tag="y", content_object=self.product_b
+        )
+        CompositeTaggedItem.objects.filter(pk=tag.pk).update(
+            object_id='[1, "missing"]'
+        )
+        product_count = CompositePKProduct.objects.count()
+        tag.refresh_from_db()
+        self.assertIsNone(tag.content_object)
+        # No target is created and other rows are unaffected.
+        self.assertEqual(CompositePKProduct.objects.count(), product_count)
+        other.refresh_from_db()
+        self.assertEqual(other.content_object, self.product_b)
+
+    def test_corrupt_reference_returns_none(self):
+        bad_values = [
+            "not json",
+            "[1]",
+            '[1, "shared", "extra"]',
+            '["not-an-int", "shared"]',
+            '"ab"',
+            "5",
+            None,
+        ]
+        for bad_value in bad_values:
+            with self.subTest(object_id=bad_value):
+                tag = CompositeTaggedItem.objects.create(
+                    tag="bad", content_object=self.product_a
+                )
+                CompositeTaggedItem.objects.filter(pk=tag.pk).update(
+                    object_id=bad_value
+                )
+                product_count = CompositePKProduct.objects.count()
+                tag.refresh_from_db()
+                # A corrupt reference must not resolve to another record
+                # sharing a component, e.g. product_a via tenant_id 1.
+                self.assertIsNone(tag.content_object)
+                self.assertEqual(
+                    CompositePKProduct.objects.count(), product_count
+                )
+                tag.delete()
+
+    def test_unsaved_target_rejected(self):
+        tag = CompositeTaggedItem.objects.create(
+            tag="u", content_object=self.product_a
+        )
+        old_object_id = tag.object_id
+        old_content_type_id = tag.content_type_id
+        for unsaved in (
+            CompositePKProduct(tenant_id=9, sku="unsaved", name="unsaved"),
+            CompositePKProduct(tenant_id=9),
+        ):
+            with self.subTest(unsaved=unsaved), self.assertRaises(ValueError):
+                tag.content_object = unsaved
+            # The failed assignment leaves the field values and cache alone.
+            self.assertEqual(tag.object_id, old_object_id)
+            self.assertEqual(tag.content_type_id, old_content_type_id)
+            self.assertEqual(tag.content_object, self.product_a)
+        tag.refresh_from_db()
+        self.assertEqual(tag.content_object, self.product_a)
+
+    def test_unencodable_component_rejected(self):
+        product = CompositePKProduct.objects.create(
+            tenant_id=3, sku="enc", name="enc"
+        )
+        product.tenant_id = "not-an-int"
+        tag = CompositeTaggedItem.objects.create(
+            tag="enc", content_object=self.product_a
+        )
+        old_object_id = tag.object_id
+        with self.assertRaises(ValueError):
+            tag.content_object = product
+        self.assertEqual(tag.object_id, old_object_id)
+        self.assertEqual(tag.content_object, self.product_a)
+
+    def test_delete_source_only_removes_source(self):
+        tag_a = CompositeTaggedItem.objects.create(
+            tag="da", content_object=self.product_a
+        )
+        tag_b = CompositeTaggedItem.objects.create(
+            tag="db", content_object=self.product_b
+        )
+        tag_a.delete()
+        self.assertFalse(
+            CompositeTaggedItem.objects.filter(pk=tag_a.pk).exists()
+        )
+        # The target and the other source are left alone.
+        self.assertTrue(CompositePKProduct.objects.filter(pk=(1, "shared")).exists())
+        self.assertTrue(CompositePKProduct.objects.filter(pk=(1, "other")).exists())
+        tag_b.refresh_from_db()
+        self.assertEqual(tag_b.content_object, self.product_b)
+
+    def test_query_by_reference(self):
+        tag_a = CompositeTaggedItem.objects.create(
+            tag="qa", content_object=self.product_a
+        )
+        tag_c = CompositeTaggedItem.objects.create(
+            tag="qc", content_object=self.product_c
+        )
+        # The shared "shared" sku component doesn't leak across references.
+        self.assertSequenceEqual(
+            CompositeTaggedItem.objects.filter(
+                content_type=self.ct, object_id='[1, "shared"]'
+            ),
+            [tag_a],
+        )
+        self.assertSequenceEqual(
+            CompositeTaggedItem.objects.filter(
+                content_type=self.ct, object_id='[2, "shared"]'
+            ),
+            [tag_c],
+        )
+
+    def test_cache_invalidation_for_object_id(self):
+        tag = CompositeTaggedItem.objects.create(
+            tag="ci", content_object=self.product_a
+        )
+        self.assertEqual(tag.content_object, self.product_a)
+        tag.object_id = '[1, "other"]'
+        self.assertEqual(tag.content_object, self.product_b)
+
+    def test_reverse_manager(self):
+        tag = self.product_a.tags.create(tag="reverse")
+        tag.refresh_from_db()
+        self.assertEqual(tag.object_id, '[1, "shared"]')
+        self.assertEqual(tag.content_object, self.product_a)
+        self.assertSequenceEqual(self.product_a.tags.all(), [tag])
+        self.assertSequenceEqual(self.product_b.tags.all(), [])
+
+    def test_reverse_manager_add(self):
+        tag = CompositeTaggedItem.objects.create(tag="add")
+        self.product_b.tags.add(tag)
+        tag.refresh_from_db()
+        self.assertEqual(tag.object_id, '[1, "other"]')
+        self.assertEqual(tag.content_object, self.product_b)
+
+    def test_reverse_prefetch(self):
+        CompositeTaggedItem.objects.create(tag="pa", content_object=self.product_a)
+        CompositeTaggedItem.objects.create(tag="pb", content_object=self.product_b)
+        with self.assertNumQueries(2):
+            products = list(
+                CompositePKProduct.objects.prefetch_related("tags").order_by("name")
+            )
+        with self.assertNumQueries(0):
+            tags = {
+                product.name: [t.tag for t in product.tags.all()]
+                for product in products
+            }
+        self.assertEqual(
+            tags, {"first": ["pa"], "second": ["pb"], "third": []}
+        )
+
+    def test_target_delete_cascades_only_to_its_sources(self):
+        tag_a = CompositeTaggedItem.objects.create(
+            tag="ca", content_object=self.product_a
+        )
+        tag_b = CompositeTaggedItem.objects.create(
+            tag="cb", content_object=self.product_b
+        )
+        self.product_a.delete()
+        self.assertFalse(
+            CompositeTaggedItem.objects.filter(pk=tag_a.pk).exists()
+        )
+        self.assertTrue(
+            CompositeTaggedItem.objects.filter(pk=tag_b.pk).exists()
+        )
+        tag_b.refresh_from_db()
+        self.assertEqual(tag_b.content_object, self.product_b)

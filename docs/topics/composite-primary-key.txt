@@ -98,9 +98,8 @@ operation.
 Composite primary keys and relations
 ====================================
 
-:ref:`Relationship fields <relationship-fields>`, including
-:ref:`generic relations <generic-relations>` do not support composite primary
-keys.
+:ref:`Relationship fields <relationship-fields>` do not support composite
+primary keys.
 
 For example, given the ``OrderLineItem`` model, the following is not
 supported::
@@ -127,6 +126,13 @@ alternative::
 ``ForeignObject`` is much like ``ForeignKey``, except that it doesn't create
 any columns (e.g. ``item_id``), foreign key constraints or indexes in the
 database, and the ``on_delete`` argument is ignored.
+
+:ref:`Generic relations <generic-relations>` do support targets with composite
+primary keys. The object ID field of a
+:class:`~django.contrib.contenttypes.fields.GenericForeignKey` stores such
+references as a JSON array of the primary key components, in the order the
+fields are declared on the ``CompositePrimaryKey`` (e.g. ``[1, "a"]``), so the
+field must be a text field.
 
 .. _cpk-and-database-functions:
 

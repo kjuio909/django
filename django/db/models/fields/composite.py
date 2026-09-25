@@ -152,10 +152,15 @@ class CompositePrimaryKey(Field):
         if isinstance(value, str):
             # Assume we're deserializing.
             vals = json.loads(value)
-            value = [
+            if not isinstance(vals, (list, tuple)):
+                raise ValueError(
+                    "Composite primary key values must be serialized as a "
+                    "JSON array, got %r." % value
+                )
+            value = tuple(
                 field.to_python(val)
                 for field, val in zip(self.fields, vals, strict=True)
-            ]
+            )
         return value
 
 

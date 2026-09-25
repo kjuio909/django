@@ -150,3 +150,33 @@ class AllowsNullGFK(models.Model):
     content_type = models.ForeignKey(ContentType, models.SET_NULL, null=True)
     object_id = models.PositiveIntegerField(null=True)
     content_object = GenericForeignKey()
+
+
+class CompositePKProduct(models.Model):
+    """A model with a composite primary key, usable as a GFK target."""
+
+    pk = models.CompositePrimaryKey("tenant_id", "sku")
+    tenant_id = models.IntegerField()
+    sku = models.CharField(max_length=64)
+    name = models.CharField(max_length=64)
+
+    tags = GenericRelation("CompositeTaggedItem")
+
+    def __str__(self):
+        return self.name
+
+
+class CompositeTaggedItem(models.Model):
+    """A tag on an object, storing object IDs (possibly composite) as text."""
+
+    tag = models.SlugField()
+    content_type = models.ForeignKey(ContentType, models.CASCADE, null=True)
+    object_id = models.TextField(null=True)
+
+    content_object = GenericForeignKey()
+
+    class Meta:
+        ordering = ["tag", "content_type__model"]
+
+    def __str__(self):
+        return self.tag

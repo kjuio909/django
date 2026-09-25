@@ -1,17 +1,23 @@
 import functools
 import itertools
+import json
 from collections import defaultdict
 
 from asgiref.sync import sync_to_async
 
 from django.contrib.contenttypes.models import ContentType
 from django.core import checks
-from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    ObjectDoesNotExist,
+    ValidationError,
+)
 from django.db import DEFAULT_DB_ALIAS, models, router, transaction
 from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
 from django.db.models.base import ModelBase, make_foreign_order_accessors
 from django.db.models.deletion import DatabaseOnDelete
 from django.db.models.fields import Field
+from django.db.models.fields.composite import CompositePrimaryKey
 from django.db.models.fields.mixins import FieldCacheMixin
 from django.db.models.fields.related import (
     ReverseManyToOneDescriptor,
@@ -23,6 +29,25 @@ from django.db.models.sql import AND
 from django.db.models.sql.where import WhereNode
 from django.db.models.utils import AltersData
 from django.utils.functional import cached_property
+
+
+def _serialize_pk(obj):
+    """
+    Return the value to store in a generic relation's object id field for a
+    reference to ``obj``.
+
+    Composite primary keys are stored as a JSON array of their components, in
+    the order the fields are declared on the CompositePrimaryKey, with each
+    component converted by its field's to_python(). Other primary keys are
+    stored as-is.
+    """
+    pk = obj._meta.pk
+    if isinstance(pk, CompositePrimaryKey):
+        return json.dumps(
+            [field.to_python(value) for field, value in zip(pk.fields, obj.pk)],
+            ensure_ascii=False,
+        )
+    return obj.pk
 
 
 class GenericForeignKey(FieldCacheMixin, Field):
@@ -70,9 +95,40 @@ class GenericForeignKey(FieldCacheMixin, Field):
     def get_forward_related_filter(self, obj):
         """See corresponding method on RelatedField"""
         return {
-            self.fk_field: obj.pk,
+            self.fk_field: _serialize_pk(obj),
             self.ct_field: ContentType.objects.get_for_model(obj).pk,
         }
+
+    def get_fk_value(self, obj):
+        """
+        Return the value to store in the object id field for a reference to
+        ``obj``, validating that the reference can be uniquely encoded.
+        """
+        pk = obj._meta.pk
+        if not isinstance(pk, CompositePrimaryKey):
+            return obj.pk
+        if obj._state.adding or any(value is None for value in obj.pk):
+            raise ValueError(
+                "Cannot assign %r: the object isn't saved and its composite "
+                "primary key cannot be encoded for a GenericForeignKey." % obj
+            )
+        try:
+            return _serialize_pk(obj)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise ValueError(
+                "Cannot encode the composite primary key %r of %r for storage "
+                "in a GenericForeignKey." % (obj.pk, obj)
+            ) from exc
+
+    def get_pk_value(self, model, value):
+        """
+        Return the primary key value encoded in the object id ``value`` for
+        ``model``. Raise an exception if the value cannot be decoded.
+        """
+        pk = model._meta.pk
+        if isinstance(pk, CompositePrimaryKey):
+            return tuple(pk.to_python(value))
+        return value
 
     def check(self, **kwargs):
         return [
@@ -212,10 +268,13 @@ class GenericForeignKeyDescriptor:
         for ct_id, fkeys in fk_dict.items():
             if ct_id in custom_queryset_dict:
                 # Return values from the custom queryset, if provided.
-                queryset = custom_queryset_dict[ct_id].filter(pk__in=fkeys)
+                queryset = custom_queryset_dict[ct_id]
+                fkeys = self._decode_fkeys(queryset.query.model, fkeys)
+                queryset = queryset.filter(pk__in=fkeys)
             else:
                 instance = instance_dict[ct_id]
                 ct = self.field.get_content_type(id=ct_id, using=instance._state.db)
+                fkeys = self._decode_fkeys(ct.model_class(), fkeys)
                 queryset = ct.get_all_objects_for_this_type(pk__in=fkeys)
 
             ret_val.extend(queryset.fetch_mode(instances[0]._state.fetch_mode))
@@ -233,14 +292,39 @@ class GenericForeignKeyDescriptor:
                 ).model_class()
                 return str(getattr(obj, self.field.fk_field)), model
 
+        def gfk_obj_key(obj):
+            pk = obj._meta.pk
+            if isinstance(pk, CompositePrimaryKey):
+                return _serialize_pk(obj), obj.__class__
+            return pk.value_to_string(obj), obj.__class__
+
         return (
             ret_val,
-            lambda obj: (obj._meta.pk.value_to_string(obj), obj.__class__),
+            gfk_obj_key,
             gfk_key,
             True,
             self.field.name,
             False,
         )
+
+    @staticmethod
+    def _decode_fkeys(model, fk_values):
+        """
+        Decode the object id values stored for references to ``model``.
+
+        References to models with composite primary keys are stored as JSON
+        arrays; undecodable values are dropped as they cannot match any row.
+        """
+        pk = model._meta.pk
+        if not isinstance(pk, CompositePrimaryKey):
+            return fk_values
+        decoded = []
+        for value in fk_values:
+            try:
+                decoded.append(tuple(pk.to_python(value)))
+            except (TypeError, ValueError, ValidationError):
+                continue
+        return decoded
 
     def __get__(self, instance, cls=None):
         if instance is None:
@@ -262,7 +346,7 @@ class GenericForeignKeyDescriptor:
                 ct_id
                 == self.field.get_content_type(obj=rel_obj, using=instance._state.db).id
             )
-            pk_match = ct_match and rel_obj._meta.pk.to_python(pk_val) == rel_obj.pk
+            pk_match = ct_match and self._pk_matches(rel_obj, pk_val)
             if pk_match:
                 return rel_obj
             else:
@@ -270,6 +354,16 @@ class GenericForeignKeyDescriptor:
 
         instance._state.fetch_mode.fetch(self, instance)
         return self.field.get_cached_value(instance)
+
+    @staticmethod
+    def _pk_matches(rel_obj, pk_val):
+        pk = rel_obj._meta.pk
+        if isinstance(pk, CompositePrimaryKey):
+            try:
+                return tuple(pk.to_python(pk_val)) == tuple(rel_obj.pk)
+            except (TypeError, ValueError, ValidationError):
+                return False
+        return pk.to_python(pk_val) == rel_obj.pk
 
     def fetch_one(self, instance):
         f = self.field.model._meta.get_field(self.field.ct_field)
@@ -279,13 +373,20 @@ class GenericForeignKeyDescriptor:
         if ct_id is not None:
             ct = self.field.get_content_type(id=ct_id, using=instance._state.db)
             try:
-                rel_obj = ct.get_object_for_this_type(
-                    using=instance._state.db, pk=pk_val
-                )
-            except ObjectDoesNotExist:
+                pk_val = self.field.get_pk_value(ct.model_class(), pk_val)
+            except (TypeError, ValueError, ValidationError):
+                # The stored reference cannot be decoded; treat it as a
+                # reference to a nonexistent object.
                 pass
             else:
-                rel_obj._state.fetch_mode = instance._state.fetch_mode
+                try:
+                    rel_obj = ct.get_object_for_this_type(
+                        using=instance._state.db, pk=pk_val
+                    )
+                except ObjectDoesNotExist:
+                    pass
+                else:
+                    rel_obj._state.fetch_mode = instance._state.fetch_mode
         self.field.set_cached_value(instance, rel_obj)
 
     def fetch_many(self, instances):
@@ -297,8 +398,11 @@ class GenericForeignKeyDescriptor:
         ct = None
         fk = None
         if value is not None:
+            # Compute the content type and object id before mutating the
+            # instance so that invalid targets leave the current reference
+            # and its cache untouched.
             ct = self.field.get_content_type(obj=value)
-            fk = value.pk
+            fk = self.field.get_fk_value(value)
 
         setattr(instance, self.field.ct_field, ct)
         setattr(instance, self.field.fk_field, fk)
@@ -581,7 +685,9 @@ class GenericRelation(ForeignObject):
                 % self.content_type_field_name: ContentType.objects.db_manager(using)
                 .get_for_model(self.model, for_concrete_model=self.for_concrete_model)
                 .pk,
-                "%s__in" % self.object_id_field_name: [obj.pk for obj in objs],
+                "%s__in" % self.object_id_field_name: [
+                    _serialize_pk(obj) for obj in objs
+                ],
             }
         )
 
@@ -629,7 +735,7 @@ def create_generic_related_manager(superclass, rel):
             self.content_type_field_name = rel.field.content_type_field_name
             self.object_id_field_name = rel.field.object_id_field_name
             self.prefetch_cache_name = rel.field.attname
-            self.pk_val = instance.pk
+            self.pk_val = _serialize_pk(instance)
 
             self.core_filters = {
                 "%s__pk" % self.content_type_field_name: self.content_type.id,
@@ -690,7 +796,10 @@ def create_generic_related_manager(superclass, rel):
                 models.Q.create(
                     [
                         (f"{self.content_type_field_name}__pk", content_type_id),
-                        (f"{self.object_id_field_name}__in", {obj.pk for obj in objs}),
+                        (
+                            f"{self.object_id_field_name}__in",
+                            {_serialize_pk(obj) for obj in objs},
+                        ),
                     ]
                 )
                 for content_type_id, objs in itertools.groupby(
@@ -701,7 +810,18 @@ def create_generic_related_manager(superclass, rel):
             query = models.Q.create(content_type_queries, connector=models.Q.OR)
             # We (possibly) need to convert object IDs to the type of the
             # instances' PK in order to match up instances:
-            object_id_converter = instances[0]._meta.pk.to_python
+            pk = instances[0]._meta.pk
+            if isinstance(pk, CompositePrimaryKey):
+
+                def object_id_converter(value):
+                    try:
+                        return tuple(pk.to_python(value))
+                    except (TypeError, ValueError, ValidationError):
+                        # Undecodable references cannot match any instance.
+                        return value
+
+            else:
+                object_id_converter = pk.to_python
             content_type_id_field_name = "%s_id" % self.content_type_field_name
             queryset = queryset.filter(query)
             # Restore subsequent cloning operations.
