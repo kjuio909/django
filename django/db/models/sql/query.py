@@ -1595,6 +1595,15 @@ class Query(BaseExpression):
         # Update used_joins before trimming since they are reused to determine
         # which joins could be later promoted to INNER.
         used_joins.update(join_info.joins)
+        if (
+            not branch_negated
+            and not current_negated
+            and any(path_info.distinct for path_info in join_info.path)
+        ):
+            # Traversing this relation may match the same row more than once
+            # (e.g. a reverse generic relation whose object reference is
+            # matched in the database), so deduplicate the result rows.
+            self.distinct = True
         targets, alias, join_list = self.trim_joins(
             join_info.targets, join_info.joins, join_info.path
         )
@@ -2138,6 +2147,10 @@ class Query(BaseExpression):
             filter_rhs = OuterRef(filter_rhs.name)
         query.add_filter(filter_lhs, filter_rhs)
         query.clear_ordering(force=True)
+        # The EXISTS subquery is a semi-join by construction, so any row
+        # deduplication implied by traversing a multi-valued relation is
+        # irrelevant inside it.
+        query.distinct = False
         # Try to have as simple as possible subquery -> trim leading joins from
         # the subquery.
         trimmed_prefix, contains_louter = query.trim_start(names_with_path)
@@ -2157,8 +2170,20 @@ class Query(BaseExpression):
             query.where.add(lookup, AND)
             query.external_aliases[alias] = True
         else:
-            lookup_class = select_field.get_lookup("exact")
-            lookup = lookup_class(col, ResolvedOuterRef(trimmed_prefix))
+            join_field = names_with_path[0][1][0].join_field
+            correlated_lookup = getattr(
+                join_field, "get_split_exclude_lookup", None
+            )
+            lookup = (
+                correlated_lookup(col, trimmed_prefix)
+                if correlated_lookup is not None
+                else None
+            )
+            if lookup is None:
+                # The default correlation: the selected value must equal the
+                # outer row's value along the trimmed prefix.
+                lookup_class = select_field.get_lookup("exact")
+                lookup = lookup_class(col, ResolvedOuterRef(trimmed_prefix))
             query.where.add(lookup, AND)
 
         condition, needed_inner = self.build_filter(Exists(query))

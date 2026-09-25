@@ -12,10 +12,11 @@ from django.core.exceptions import (
     ObjectDoesNotExist,
     ValidationError,
 )
-from django.db import DEFAULT_DB_ALIAS, models, router, transaction
+from django.db import DEFAULT_DB_ALIAS, NotSupportedError, models, router, transaction
 from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
 from django.db.models.base import ModelBase, make_foreign_order_accessors
 from django.db.models.deletion import DatabaseOnDelete
+from django.db.models.expressions import Col, Expression, ResolvedOuterRef
 from django.db.models.fields import Field
 from django.db.models.fields.composite import CompositePrimaryKey
 from django.db.models.fields.mixins import FieldCacheMixin
@@ -30,11 +31,162 @@ from django.db.models.sql.where import WhereNode
 from django.db.models.utils import AltersData
 from django.utils.functional import cached_property
 
-
 # Sentinel used as part of a prefetch match key for a reference that couldn't
 # be decoded. It's an object instance (never produced by to_python()), so the
 # key can't collide with a real composite primary key.
 INVALID_COMPOSITE_REFERENCE = object()
+
+
+def _composite_component_json_type(field):
+    """
+    Return the JSON type (``integer``, ``real`` or ``text``) that a component
+    field's values are encoded as by GenericForeignKey.encode_composite_pk().
+
+    A JSON element of another type can never match the component, so joins can
+    enforce strict typing the same way decode_composite_pk() does in Python:
+    a JSON number never stands in for a text component and vice versa, and the
+    JSON booleans true/false are distinct from the integers 1/0.
+    """
+    if isinstance(field, models.BooleanField):
+        return "boolean"
+    if isinstance(field, models.IntegerField):
+        return "integer"
+    if isinstance(field, models.FloatField):
+        return "real"
+    # Other component kinds (CharField/TextField, date/time fields, UUIDField,
+    # ...) are encoded as JSON strings. Components that can't be JSON encoded
+    # (e.g. DecimalField) can never have a valid reference stored, so treating
+    # them as text means a numeric element is safely rejected rather than
+    # coerced into a match.
+    return "text"
+
+
+class CompositeGenericKeyMatch(Expression):
+    """
+    Predicate matching a GenericForeignKey's JSON-array text reference
+    (``object_id``) against the individual columns of a related model's
+    CompositePrimaryKey.
+
+    The predicate is defensive about the stored reference:
+
+    * a SQL NULL reference never matches;
+    * malformed JSON, a non-array value, or an array with the wrong number of
+      components never match and never raise a database error (the element
+      checks are only evaluated inside a ``CASE`` once the reference has been
+      validated);
+    * each element must have exactly the JSON type produced by the component
+      field, so an integer can't stand in for a string, the booleans
+      ``true``/``false`` can't stand in for 1/0, and a JSON ``null`` only
+      matches a column that is itself NULL.
+
+    Two construction modes are supported:
+
+    * :meth:`for_aliases` -- an ordinary join, with both the JSON reference
+      column and the composite primary key columns already resolved against
+      concrete table aliases;
+    * :meth:`correlated` -- the ``split_exclude()`` case, where the composite
+      primary key is an unresolved :class:`ColPairs` referencing the outer
+      query. It's resolved by resolve_expression() when the subquery predicate
+      is resolved against the outer query.
+    """
+
+    conditional = True
+    allows_composite_expressions = True
+    output_field = models.BooleanField()
+
+    def __init__(self, object_id_col, target_cols=(), outer_pk=None):
+        super().__init__()
+        self.lhs = object_id_col
+        # WhereNode._resolve_node() resolves a node's ``rhs`` attribute, so in
+        # the correlated case the ResolvedOuterRef is turned into the outer
+        # query's ColPairs there. In the join case ``rhs`` is simply the
+        # concrete primary key columns.
+        self.rhs = outer_pk if outer_pk is not None else tuple(target_cols)
+
+    @classmethod
+    def for_aliases(cls, source_alias, object_id_field, target_alias, pk_fields):
+        return cls(
+            Col(source_alias, object_id_field),
+            target_cols=[Col(target_alias, field) for field in pk_fields],
+        )
+
+    @classmethod
+    def correlated(cls, object_id_col, outer_pk):
+        return cls(object_id_col, outer_pk=outer_pk)
+
+    def __repr__(self):
+        return "<%s: %s -> %s composite primary key>" % (
+            self.__class__.__name__,
+            self.lhs,
+            self.rhs,
+        )
+
+    @property
+    def target_cols(self):
+        # A resolved ColPairs (correlated case) iterates over its Cols; a
+        # tuple already is the sequence of Cols (join case).
+        return tuple(self.rhs)
+
+    def get_source_expressions(self):
+        rhs = self.rhs
+        return [self.lhs, *(rhs if isinstance(rhs, (tuple, list)) else [rhs])]
+
+    def set_source_expressions(self, exprs):
+        self.lhs = exprs[0]
+        rest = exprs[1:]
+        self.rhs = rest[0] if len(rest) == 1 else tuple(rest)
+
+    def relabeled_clone(self, relabels):
+        rhs = self.rhs
+        if isinstance(rhs, (tuple, list)):
+            new_rhs = tuple(col.relabeled_clone(relabels) for col in rhs)
+        else:
+            new_rhs = rhs.relabeled_clone(relabels)
+        clone = self.__class__(self.lhs.relabeled_clone(relabels))
+        clone.rhs = new_rhs
+        return clone
+
+    def as_sqlite(self, compiler, connection):
+        # Col compiles to a quoted table.column with no parameters.
+        ref, _ = compiler.compile(self.lhs)
+        fragments = [
+            f"{ref} IS NOT NULL",
+            f"json_valid({ref}) = 1",
+            f"json_type({ref}) = 'array'",
+            f"json_array_length({ref}) = %s",
+        ]
+        params = [len(self.target_cols)]
+        for index, col in enumerate(self.target_cols):
+            col_sql, col_params = compiler.compile(col)
+            path = "$[%d]" % index
+            json_type_name = _composite_component_json_type(col.target)
+            null_type_sql = f"json_type({ref}, %s)"
+            value_type_sql = (
+                f"{null_type_sql} IN ('true', 'false')"
+                if json_type_name == "boolean"
+                else f"{null_type_sql} = %s"
+            )
+            fragments.append(
+                "("
+                f"({null_type_sql} = 'null' AND {col_sql} IS NULL) OR "
+                f"({value_type_sql} AND json_extract({ref}, %s) = {col_sql})"
+                ")"
+            )
+            if json_type_name == "boolean":
+                # null-check path; type-check path; extract path
+                params.extend([path, path, path])
+            else:
+                # null-check path; type-check path + JSON type name; extract
+                params.extend([path, path, json_type_name, path])
+            params.extend(col_params)
+        return "CASE WHEN %s THEN 1 END" % " AND ".join(fragments), tuple(params)
+
+    def as_sql(self, compiler, connection):
+        raise NotSupportedError(
+            "Cross-relation queries on a GenericRelation to a model with a "
+            "CompositePrimaryKey are only supported on database backends that "
+            "can query the stored JSON object reference."
+        )
 
 
 class GenericForeignKey(FieldCacheMixin, Field):
@@ -512,6 +664,25 @@ class GenericRel(ForeignObjectRel):
             on_delete=DO_NOTHING,
         )
 
+    def get_joining_fields(self):
+        # When the related model has a CompositePrimaryKey the object id isn't
+        # compared against a column at all -- the reference is a JSON array.
+        # The whole matching predicate is produced by get_extra_restriction(),
+        # so there are no ordinary column-to-column join conditions.
+        if isinstance(self.field.model._meta.pk, CompositePrimaryKey):
+            return ()
+        return super().get_joining_fields()
+
+    def get_split_exclude_lookup(self, selected_col, trimmed_prefix):
+        # For a CompositePrimaryKey target the subquery selects the JSON
+        # reference column; correlate it with the outer target's composite
+        # primary key instead of doing a single-column equality comparison.
+        if isinstance(self.field.model._meta.pk, CompositePrimaryKey):
+            return CompositeGenericKeyMatch.correlated(
+                selected_col, ResolvedOuterRef(trimmed_prefix)
+            )
+        return None
+
 
 class GenericRelation(ForeignObject):
     """
@@ -613,6 +784,13 @@ class GenericRelation(ForeignObject):
             )
         ]
 
+    @property
+    def related_model_has_composite_pk(self):
+        return isinstance(self.model._meta.pk, CompositePrimaryKey)
+
+    def _composite_pk_fields(self):
+        return self.model._meta.pk.fields
+
     def get_local_related_value(self, instance):
         return self.get_instance_value_for_fields(instance, self.foreign_related_fields)
 
@@ -653,6 +831,7 @@ class GenericRelation(ForeignObject):
                 m2m=True,
                 direct=False,
                 filtered_relation=filtered_relation,
+                distinct=self.related_model_has_composite_pk,
             )
         )
         # Collect joins needed for the parent -> child chain. This is easiest
@@ -685,6 +864,7 @@ class GenericRelation(ForeignObject):
                     m2m=True,
                     direct=False,
                     filtered_relation=filtered_relation,
+                    distinct=self.related_model_has_composite_pk,
                 )
             ]
 
@@ -751,10 +931,28 @@ class GenericRelation(ForeignObject):
         )
 
     def get_extra_restriction(self, alias, remote_alias):
+        # ``remote_alias`` is the table holding the GenericForeignKey columns
+        # (the source); ``alias`` is this relation's model (the target).
         field = self.remote_field.model._meta.get_field(self.content_type_field_name)
         contenttype_pk = self.get_content_type().pk
         lookup = field.get_lookup("exact")(field.get_col(remote_alias), contenttype_pk)
-        return WhereNode([lookup], connector=AND)
+        where = WhereNode([lookup], connector=AND)
+        # During split_exclude() the leading join is trimmed away and ``alias``
+        # is None; the composite-predicate correlation is added separately by
+        # GenericRel.get_split_exclude_lookup() there.
+        if alias is not None and self.related_model_has_composite_pk:
+            object_id_field = self.remote_field.model._meta.get_field(
+                self.object_id_field_name
+            )
+            where.children.append(
+                CompositeGenericKeyMatch.for_aliases(
+                    source_alias=remote_alias,
+                    object_id_field=object_id_field,
+                    target_alias=alias,
+                    pk_fields=self._composite_pk_fields(),
+                )
+            )
+        return where
 
     def bulk_related_objects(self, objs, using=DEFAULT_DB_ALIAS):
         """

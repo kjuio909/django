@@ -137,6 +137,7 @@ class GFKCompositeDateTarget(models.Model):
 
 class GFKCompositeAttachment(models.Model):
     text = models.CharField(max_length=100, default="", blank=True)
+    n = models.IntegerField(null=True)
     content_type = models.ForeignKey(ContentType, models.CASCADE, null=True)
     object_id = models.TextField(null=True)
     content_object = GenericForeignKey()
