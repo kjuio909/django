@@ -1,9 +1,10 @@
+from collections.abc import Iterable
 from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 from asgiref.local import Local
 
 from django.http import QueryDict
-from django.utils.functional import lazy
+from django.utils.functional import Promise, lazy
 from django.utils.translation import override
 
 from .exceptions import NoReverseMatch, Resolver404
@@ -17,6 +18,100 @@ _prefixes = Local()
 
 # Overridden URLconfs for each thread are stored here.
 _urlconfs = Local()
+
+
+def _query_leaves(value):
+    """
+    Yield the scalar query values contained in *value*, in input order.
+
+    Strings, bytes, lazy string proxies and non-iterable objects are yielded
+    unchanged so that urllib's urlencode() semantics apply (str() conversion,
+    bytes quoting, ``None`` -> ``"None"`` and so on). Lists, tuples, sets and
+    other iterables are expanded recursively, so a container is never written
+    to the URL through its repr().
+    """
+    if isinstance(value, (str, bytes, Promise)):
+        yield value
+    elif isinstance(value, Iterable):
+        for item in value:
+            yield from _query_leaves(item)
+    else:
+        yield value
+
+
+def _query_pairs(query):
+    """
+    Yield (key, scalar_value) pairs for a reverse() ``query`` argument.
+
+    The iteration order of the supplied container is preserved. Objects
+    exposing an ``items()`` method are treated as mappings (mirroring
+    urllib.parse.urlencode()), other sequences are walked in their own order.
+    The container validation mirrors urlencode() so the same TypeErrors are
+    raised for invalid input; the argument is only read, never modified.
+    """
+    if hasattr(query, "items"):
+        items = query.items()
+    else:
+        try:
+            # Mirrors urlencode(): only sequences whose first element is a
+            # (key, value) tuple are accepted; bare scalars, strings and
+            # non-indexable containers fail here.
+            if len(query) and not isinstance(query[0], tuple):
+                raise TypeError
+        except TypeError as err:
+            raise TypeError(
+                "not a valid non-string sequence or mapping object"
+            ) from err
+        items = query
+    for pair in items:
+        key, value = pair
+        for leaf in _query_leaves(value):
+            yield key, leaf
+
+
+def _append_query_fragment(url, query=None, fragment=None):
+    """
+    Append an encoded query string and/or fragment identifier to *url*, a
+    path returned by the URL resolver.
+
+    The query string follows the path and the fragment always comes last.
+    Separators are never added for an absent value, an explicitly empty
+    fragment still terminates the URL with ``#``, and a query or fragment
+    already present in *url* is joined rather than given a second separator.
+    """
+    scheme, netloc, path, existing_query, existing_fragment = urlsplit(url)
+    if query is not None:
+        if isinstance(query, QueryDict):
+            # QueryDict.urlencode() keeps every repeated value, in insertion
+            # order, and honours the QueryDict's own encoding.
+            query_string = query.urlencode()
+        else:
+            # Values are already expanded into scalars, so doseq=False keeps
+            # lazy string proxies intact (doseq=True would iterate them
+            # character by character). An empty container yields "".
+            query_string = urlencode(list(_query_pairs(query)), doseq=False)
+        if query_string:
+            existing_query = (
+                f"{existing_query}&{query_string}" if existing_query else query_string
+            )
+    fragment_is_empty = False
+    if fragment is not None:
+        # A plain str is accepted, as are lazy string proxies, which behave
+        # exactly like str once evaluated. Everything else raises TypeError,
+        # matching the previous str-concatenation contract.
+        if not isinstance(fragment, (str, Promise)):
+            raise TypeError(
+                "fragment must be a string, not %s" % type(fragment).__name__
+            )
+        fragment = str(fragment)
+        fragment_is_empty = not fragment
+        existing_fragment = fragment
+    url = urlunsplit((scheme, netloc, path, existing_query, existing_fragment))
+    # urlunsplit() drops an empty fragment, but an explicitly supplied empty
+    # fragment must still end the URL with "#".
+    if fragment_is_empty and not url.endswith("#"):
+        url += "#"
+    return url
 
 
 def resolve(path, urlconf=None):
@@ -96,15 +191,8 @@ def reverse(
             )
 
     resolved_url = resolver._reverse_with_prefix(view, prefix, *args, **kwargs)
-    if query is not None:
-        if isinstance(query, QueryDict):
-            query_string = query.urlencode()
-        else:
-            query_string = urlencode(query, doseq=True)
-        if query_string:
-            resolved_url += "?" + query_string
-    if fragment is not None:
-        resolved_url += "#" + fragment
+    if query is not None or fragment is not None:
+        resolved_url = _append_query_fragment(resolved_url, query, fragment)
     return resolved_url
 
 

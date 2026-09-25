@@ -71,10 +71,18 @@ The ``query`` keyword argument specifies parameters to be added to the returned
 URL. It can accept an instance of :class:`~django.http.QueryDict` (such as
 ``request.GET``) or any value compatible with :func:`urllib.parse.urlencode`.
 The encoded query string is appended to the resolved URL, prefixed by a ``?``.
+When a key maps to an iterable of values (including nested iterables), every
+value is expanded into a repeated key in the order of the input, and containers
+are never rendered through their ``repr()``. Empty values keep their ``=``.
+The public iteration order of the supplied container is preserved, and the
+argument is read without being modified. An empty query (``None``, an empty
+mapping or sequence, or an empty ``QueryDict``) does not add a ``?``.
 
 The ``fragment`` keyword argument specifies a fragment identifier to be
 appended to the returned URL (that is, after the path and query string,
-preceded by a ``#``).
+preceded by a ``#``). It must be a string, which is appended verbatim without
+any percent-encoding; pass ``""`` to end the URL with a bare ``#``, or ``None``
+(the default) to omit the fragment entirely.
 
 For example:
 

@@ -5,6 +5,7 @@ Unit tests for reverse URL lookups.
 import pickle
 import sys
 import threading
+from collections import OrderedDict
 
 from admin_scripts.tests import AdminScriptTestCase
 
@@ -36,7 +37,9 @@ from django.urls import (
     reverse,
     reverse_lazy,
 )
+from django.urls.base import _append_query_fragment
 from django.urls.resolvers import RegexPattern
+from django.utils.functional import lazy
 
 from . import middleware, urlconf_outer, views
 from .utils import URLObject
@@ -612,6 +615,186 @@ class URLPatternReverse(SimpleTestCase):
         query_string = "a=1&b=2&b=3&c=4"
         query_dict = QueryDict(query_string)
         self.assertEqual(reverse("test", query=query_dict), f"/test/1?{query_string}")
+
+    def test_reverse_with_query_scalar_types(self):
+        tests = [
+            ([("i", 5)], "/test/1?i=5"),
+            ([("b", True)], "/test/1?b=True"),
+            ([("n", None)], "/test/1?n=None"),
+            ([("s", "abc")], "/test/1?s=abc"),
+            ([("s", b"abc")], "/test/1?s=abc"),
+            ([("empty", "")], "/test/1?empty="),
+        ]
+        for query, expected in tests:
+            with self.subTest(query=query):
+                self.assertEqual(reverse("test", query=query), expected)
+
+    def test_reverse_with_query_multivalue_expansion(self):
+        cases = [
+            ({"k": [1, 2, 3]}, "/test/1?k=1&k=2&k=3"),
+            ({"k": (1, 2, 3)}, "/test/1?k=1&k=2&k=3"),
+            ([("k", [1, 2, 3])], "/test/1?k=1&k=2&k=3"),
+            ([("k", 1), ("k", 2), ("k", 3)], "/test/1?k=1&k=2&k=3"),
+            # Nested containers are expanded, never rendered through repr().
+            ({"k": [[1, 2], [3]]}, "/test/1?k=1&k=2&k=3"),
+            ({"k": (1, [2, 3], (4,))}, "/test/1?k=1&k=2&k=3&k=4"),
+        ]
+        for query, expected in cases:
+            with self.subTest(query=repr(query)):
+                self.assertEqual(reverse("test", query=query), expected)
+
+    def test_reverse_with_query_generator_value(self):
+        def values():
+            yield from (1, 2)
+
+        self.assertEqual(reverse("test", query={"k": values()}), "/test/1?k=1&k=2")
+
+    def test_reverse_with_query_set_value_order(self):
+        # A set's values are expanded; their order matches set iteration.
+        values = {1, 2}
+        self.assertEqual(
+            reverse("test", query={"k": values}),
+            "/test/1?" + "&".join(f"k={v}" for v in values),
+        )
+
+    def test_reverse_with_query_container_not_repr(self):
+        # A nested container must never be rendered via repr() into the URL.
+        url = reverse("test", query={"a": [[1, 2]]})
+        self.assertNotIn("[", url)
+        self.assertNotIn("]", url)
+        self.assertEqual(url, "/test/1?a=1&a=2")
+
+    def test_reverse_with_query_container_order(self):
+        # Each container keeps its own public iteration order.
+        sequence = [("z", 1), ("a", 2), ("z", 3)]
+        self.assertEqual(reverse("test", query=sequence), "/test/1?z=1&a=2&z=3")
+        mapping = OrderedDict([("z", 1), ("a", 2), ("z", 3)])
+        # A mapping collapses duplicate keys, keeping the last value, without
+        # resorting the remaining keys.
+        self.assertEqual(reverse("test", query=mapping), "/test/1?z=3&a=2")
+
+    def test_reverse_with_query_lazy_string(self):
+        lazy_string = lazy(str, str)("hello")
+        self.assertEqual(reverse("test", query={"a": lazy_string}), "/test/1?a=hello")
+        self.assertEqual(reverse("test", query={"a": [lazy_string]}), "/test/1?a=hello")
+
+    def test_reverse_with_query_not_mutated(self):
+        mapping = {"a": [1, 2], "b": ""}
+        mapping_snapshot = repr(mapping)
+        reverse("test", query=mapping)
+        self.assertEqual(repr(mapping), mapping_snapshot)
+
+        query_dict = QueryDict("a=1&b=2&b=3")
+        query_dict_snapshot = query_dict.urlencode()
+        reverse("test", query=query_dict)
+        self.assertEqual(query_dict.urlencode(), query_dict_snapshot)
+
+    def test_reverse_with_query_encoding(self):
+        self.assertEqual(
+            reverse(
+                "test",
+                query={"kéy": "välue /x", "a/b?": "c&d=e", "pct": "100%"},
+            ),
+            "/test/1?" "k%C3%A9y=v%C3%A4lue+%2Fx&a%2Fb%3F=c%26d%3De&pct=100%25",
+        )
+
+    def test_reverse_with_query_encoded_once(self):
+        url = reverse("test", query={"a": "100%"})
+        self.assertEqual(url.count("%25"), 1)
+        self.assertEqual(url, "/test/1?a=100%25")
+        # Repeated calls produce byte-identical output.
+        self.assertEqual(reverse("test", query={"a": "100%"}), url)
+
+    def test_reverse_with_query_fragment_combination(self):
+        url = reverse(
+            "test",
+            query=[("a", 1), ("a", 2), ("empty", ""), ("none", None)],
+            fragment="section",
+        )
+        self.assertEqual(url, "/test/1?a=1&a=2&empty=&none=None#section")
+        # Byte-level stability across calls.
+        self.assertEqual(
+            reverse(
+                "test",
+                query=[("a", 1), ("a", 2), ("empty", ""), ("none", None)],
+                fragment="section",
+            ),
+            url,
+        )
+
+    def test_reverse_fragment_ordering(self):
+        # The fragment always follows the query string.
+        self.assertEqual(reverse("test", query={"a": 1}, fragment="f"), "/test/1?a=1#f")
+
+    def test_reverse_fragment_not_encoded_or_mixed_into_path(self):
+        fragment = "café #/?%s"
+        self.assertEqual(reverse("test", fragment=fragment), f"/test/1#{fragment}")
+        url = reverse("test", query={"a": "1"}, fragment=fragment)
+        self.assertTrue(url.startswith("/test/1?a=1#"))
+        self.assertEqual(url.removeprefix("/test/1?a=1#"), fragment)
+
+    def test_reverse_lazy_fragment(self):
+        self.assertEqual(
+            reverse("test", fragment=lazy(str, str)("tab-1")), "/test/1#tab-1"
+        )
+
+    def test_reverse_no_separator_for_empty_inputs(self):
+        self.assertEqual(reverse("test", query={}), "/test/1")
+        self.assertEqual(reverse("test", query=[]), "/test/1")
+        self.assertEqual(reverse("test", query=QueryDict()), "/test/1")
+        self.assertEqual(reverse("test"), "/test/1")
+        # An explicitly empty fragment keeps the "#".
+        self.assertEqual(reverse("test", fragment=""), "/test/1#")
+        # An empty query with a fragment adds no "?".
+        self.assertEqual(reverse("test", query={}, fragment="f"), "/test/1#f")
+
+    def test_reverse_existing_query_or_fragment_not_duplicated(self):
+        # Helper-level contract: a base path already carrying a query string
+        # or fragment must not be given a second separator.
+        self.assertEqual(
+            _append_query_fragment("/p/?x=1", query={"a": 2}), "/p/?x=1&a=2"
+        )
+        self.assertEqual(
+            _append_query_fragment("/p/#frag", query={"a": 2}), "/p/?a=2#frag"
+        )
+        self.assertEqual(
+            _append_query_fragment("/p/#frag", fragment="other"), "/p/#other"
+        )
+        self.assertEqual(
+            _append_query_fragment("/p/?x=1#f", query={"a": 2}, fragment="g"),
+            "/p/?x=1&a=2#g",
+        )
+
+    def test_reverse_invalid_query_failure_has_no_side_effect(self):
+        cases = [0, False, [1, 3, 5], {1, 2, 3}, "string"]
+        for query in cases:
+            with self.subTest(query=query):
+                with self.assertRaises(TypeError):
+                    reverse("test", query=query)
+
+    def test_reverse_invalid_fragment_type(self):
+        cases = [0, False, b"bytes", {}, [], set(), ()]
+        for fragment in cases:
+            with self.subTest(fragment=fragment):
+                with self.assertRaises(TypeError):
+                    reverse("test", fragment=fragment)
+
+    def test_reverse_noreversematch_takes_precedence(self):
+        # A bad view name raises NoReverseMatch even if query/fragment are
+        # invalid, and nothing about the call mutates shared state.
+        with self.assertRaises(NoReverseMatch):
+            reverse("does-not-exist", query=0)
+        with self.assertRaises(NoReverseMatch):
+            reverse("does-not-exist", fragment=0)
+        # A valid call afterwards is unaffected.
+        self.assertEqual(reverse("test"), "/test/1")
+
+    def test_reverse_with_query_tail_slash_preserved(self):
+        self.assertEqual(reverse("hardcoded", query={"a": 1}), "/hardcoded/?a=1")
+
+    def test_reverse_lazy_with_query_fragment(self):
+        url = reverse_lazy("test", query={"a": [1, 2]}, fragment="f")
+        self.assertEqual(str(url), "/test/1?a=1&a=2#f")
 
 
 class ResolverTests(SimpleTestCase):
