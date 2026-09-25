@@ -1,12 +1,17 @@
+from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.db import connection
+from django.db.models import Count, Q
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from .models import (
+    Answer,
     GFKCompositeAttachment,
     GFKCompositeDateTarget,
     GFKCompositeTarget,
+    Question,
 )
 
 
@@ -325,3 +330,437 @@ class GFKInvalidReferenceTestCase(TestCase):
             )
             column_types = {row[1]: row[2] for row in cursor.fetchall()}
         self.assertEqual(column_types["object_id"].upper(), "TEXT")
+
+
+class GFKCompositeRelationQueryTestCase(TestCase):
+    """
+    Queries across the reverse generic relation (GenericRelation) of a model
+    whose primary key is composite. The join must happen in the database.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        # Two targets sharing exactly one primary key component (code=1),
+        # plus a third sharing the other component (tenant="1") with the
+        # first one.
+        cls.target_a = GFKCompositeTarget.objects.create(code=1, tenant="1")
+        cls.target_b = GFKCompositeTarget.objects.create(code=1, tenant="2")
+        cls.target_c = GFKCompositeTarget.objects.create(code=2, tenant="1")
+        # Sources are saved crosswise; target_a has two matching sources,
+        # target_b has one, and target_c has none.
+        cls.source_apple = GFKCompositeAttachment.objects.create(
+            text="apple", content_object=cls.target_a
+        )
+        cls.source_apricot = GFKCompositeAttachment.objects.create(
+            text="apricot", content_object=cls.target_a
+        )
+        cls.source_banana = GFKCompositeAttachment.objects.create(
+            text="banana", content_object=cls.target_b
+        )
+
+    def _snapshot_database(self):
+        sources = list(
+            GFKCompositeAttachment.objects.order_by("pk").values(
+                "pk", "text", "content_type_id", "object_id"
+            )
+        )
+        targets = list(
+            GFKCompositeTarget.objects.order_by("pk").values("code", "tenant")
+        )
+        return sources, targets
+
+    def test_filter_by_source_field_returns_each_target_once(self):
+        # target_a has two matching sources; it must be counted only once.
+        qs = GFKCompositeTarget.objects.filter(
+            attachments__text__startswith="a"
+        ).distinct()
+        with self.assertNumQueries(1):
+            result = list(qs)
+        self.assertEqual(result, [self.target_a])
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs.count(), len(result))
+        # The shared code=1 component doesn't pull in target_b.
+        self.assertNotIn(self.target_b, result)
+
+    def test_filter_exact_comparison_and_range(self):
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text="banana")),
+            [self.target_b],
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__id__gt=self.source_apricot.pk
+                )
+            ),
+            [self.target_b],
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__id__lt=self.source_apricot.pk
+                )
+            ),
+            [self.target_a],
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__id__range=(
+                        self.source_apple.pk,
+                        self.source_apricot.pk,
+                    )
+                ).distinct()
+            ),
+            [self.target_a],
+        )
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(
+                attachments__text__in=["apple", "banana"]
+            ).distinct(),
+            [self.target_a, self.target_b],
+        )
+        # Multiple conditions on the source combine on the same join.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__text__startswith="a",
+                    attachments__id__gte=self.source_apple.pk,
+                ).distinct()
+            ),
+            [self.target_a],
+        )
+
+    def test_target_and_source_conditions_must_both_hold(self):
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    tenant="1", attachments__text="apple"
+                )
+            ),
+            [self.target_a],
+        )
+        # The source condition alone would match target_a, but its tenant
+        # is "1", not "2"; neither condition may be relaxed.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    tenant="2", attachments__text="apple"
+                )
+            ),
+            [],
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    Q(code=2) & Q(attachments__text="apple")
+                )
+            ),
+            [],
+        )
+        # Cross-relation filters compose with regular queryset filters.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(tenant="1").filter(
+                    attachments__text="apple"
+                )
+            ),
+            [self.target_a],
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    Q(attachments__text="banana") | Q(tenant="1")
+                ).distinct()
+            ),
+            [self.target_a, self.target_b, self.target_c],
+        )
+
+    def test_exclude_only_excludes_targets_with_matching_sources(self):
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(attachments__text="apple"),
+            [self.target_b, self.target_c],
+        )
+        # target_a is excluded once even though two of its sources match.
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(attachments__text__startswith="a"),
+            [self.target_b, self.target_c],
+        )
+        # Nothing matches, so nothing is excluded.
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(attachments__text="missing"),
+            [self.target_a, self.target_b, self.target_c],
+        )
+        # Target and source conditions must hold together in the subquery.
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(
+                Q(attachments__text="apple") & Q(tenant="1")
+            ),
+            [self.target_b, self.target_c],
+        )
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(
+                Q(attachments__text="apple") & Q(tenant="2")
+            ),
+            [self.target_a, self.target_b, self.target_c],
+        )
+
+    def test_prefetch_attributes_sources_to_correct_targets(self):
+        targets = list(
+            GFKCompositeTarget.objects.filter(attachments__text__startswith="a")
+            .distinct()
+            .prefetch_related("attachments")
+        )
+        self.assertEqual(targets, [self.target_a])
+        # Both matching sources belong to target_a, none to the target that
+        # shares its code component.
+        self.assertCountEqual(
+            targets[0].attachments.all(), [self.source_apple, self.source_apricot]
+        )
+        all_targets = {
+            target.pk: list(target.attachments.all())
+            for target in GFKCompositeTarget.objects.prefetch_related("attachments")
+        }
+        self.assertCountEqual(
+            all_targets[(1, "1")], [self.source_apple, self.source_apricot]
+        )
+        self.assertEqual(all_targets[(1, "2")], [self.source_banana])
+        self.assertEqual(all_targets[(2, "1")], [])
+
+    def test_filter_prefetch_and_direct_read_agree(self):
+        filtered = GFKCompositeTarget.objects.filter(attachments__text="apple").get()
+        prefetched = {
+            source.text: source.content_object
+            for source in GFKCompositeAttachment.objects.prefetch_related(
+                "content_object"
+            )
+        }
+        self.assertEqual(filtered, self.target_a)
+        self.assertEqual(prefetched["apple"], filtered)
+        self.source_apple.refresh_from_db()
+        self.assertEqual(self.source_apple.content_object, filtered)
+
+    def test_annotate_count_across_relation(self):
+        counts = {
+            target.pk: target.source_count
+            for target in GFKCompositeTarget.objects.annotate(
+                source_count=Count("attachments")
+            )
+        }
+        self.assertEqual(counts, {(1, "1"): 2, (1, "2"): 1, (2, "1"): 0})
+
+    def test_invalid_references_are_not_joined(self):
+        other_content_type = ContentType.objects.get_for_model(GFKCompositeDateTarget)
+        content_type = ContentType.objects.get_for_model(GFKCompositeTarget)
+        cases = {
+            # Null reference: neither content type nor object id.
+            "null-reference": (None, None),
+            # Null reference with a content type set.
+            "null-object-id": (content_type, None),
+            # Content type of another model, well-formed reference.
+            "wrong-content-type": (other_content_type, '[1, "1"]'),
+            # Not JSON at all.
+            "bad-json": (content_type, "{not json"),
+            # Wrong number of components.
+            "too-few-components": (content_type, "[1]"),
+            "too-many-components": (content_type, '[1, "1", 3]'),
+            # A component that can't be converted to the field type.
+            "conversion-failure": (content_type, '["oops", "1"]'),
+            # Well-formed but no such target.
+            "nonexistent-target": (content_type, '[7, "missing"]'),
+            # Shares code=1 with real targets but matches none of them.
+            "shared-component-only": (content_type, '[1, "someone-else"]'),
+            # A null component can't match the NOT NULL tenant column.
+            "null-component": (content_type, "[1, null]"),
+            # An integer can't stand in for the string tenant.
+            "type-confused": (content_type, "[1, 1]"),
+        }
+        sources = [
+            GFKCompositeAttachment.objects.create(text=text) for text in cases
+        ]
+        for source in sources:
+            content_type_value, object_id = cases[source.text]
+            GFKCompositeAttachment.objects.filter(pk=source.pk).update(
+                content_type=content_type_value, object_id=object_id
+            )
+        before = self._snapshot_database()
+        texts = list(cases)
+        with self.subTest("filter"):
+            self.assertEqual(
+                list(GFKCompositeTarget.objects.filter(attachments__text__in=texts)),
+                [],
+            )
+            self.assertEqual(
+                GFKCompositeTarget.objects.filter(attachments__text__in=texts).count(),
+                0,
+            )
+        with self.subTest("exclude"):
+            self.assertCountEqual(
+                GFKCompositeTarget.objects.exclude(attachments__text__in=texts),
+                [self.target_a, self.target_b, self.target_c],
+            )
+        with self.subTest("prefetch"):
+            prefetched = {
+                source.text: source.content_object
+                for source in GFKCompositeAttachment.objects.filter(
+                    text__in=texts
+                ).prefetch_related("content_object")
+            }
+            self.assertEqual(prefetched, {text: None for text in texts})
+        # The broken rows were left untouched and no query wrote anything.
+        self.assertEqual(self._snapshot_database(), before)
+
+    def test_special_value_components(self):
+        special_tenants = [
+            "",
+            "None",
+            "literal@at",
+            "a/b",
+            "a,b",
+            "café ★ → 日本語",
+            'quote "x"',
+        ]
+        content_type = ContentType.objects.get_for_model(GFKCompositeTarget)
+        for index, tenant in enumerate(special_tenants, start=10):
+            target = GFKCompositeTarget.objects.create(code=index, tenant=tenant)
+            # A sibling sharing the code component must never be matched.
+            GFKCompositeTarget.objects.create(code=index, tenant="other")
+            GFKCompositeAttachment.objects.create(
+                text="ref-%s" % index, content_object=target
+            )
+        before = self._snapshot_database()
+        for index, tenant in enumerate(special_tenants, start=10):
+            with self.subTest(tenant=tenant):
+                source = GFKCompositeAttachment.objects.get(text="ref-%s" % index)
+                # The reference round-trips through the database unchanged.
+                self.assertEqual(
+                    source.object_id,
+                    GenericForeignKey.encode_composite_pk(
+                        GFKCompositeTarget._meta.pk, (index, tenant)
+                    ),
+                )
+                self.assertEqual(source.content_type_id, content_type.pk)
+                self.assertEqual(source.content_object.pk, (index, tenant))
+                filtered = list(
+                    GFKCompositeTarget.objects.filter(
+                        attachments__text="ref-%s" % index
+                    )
+                )
+                self.assertEqual(
+                    filtered,
+                    [GFKCompositeTarget.objects.get(code=index, tenant=tenant)],
+                )
+                excluded = GFKCompositeTarget.objects.exclude(
+                    attachments__text="ref-%s" % index
+                )
+                self.assertNotIn((index, tenant), [t.pk for t in excluded])
+                self.assertIn(
+                    (index, "other"), [t.pk for t in excluded],
+                )
+        self.assertEqual(self._snapshot_database(), before)
+
+    def test_empty_string_component_is_not_confused_with_null(self):
+        target = GFKCompositeTarget.objects.create(code=20, tenant="")
+        source = GFKCompositeAttachment.objects.create(
+            text="empty", content_object=target
+        )
+        # A null reference doesn't match the empty-string component.
+        GFKCompositeAttachment.objects.create(text="nullref")
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text="empty")),
+            [target],
+        )
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text="nullref")),
+            [],
+        )
+        source.refresh_from_db()
+        self.assertEqual(source.object_id, '[20, ""]')
+        self.assertEqual(source.content_object, target)
+
+    def test_queries_do_not_write_to_the_database(self):
+        before = self._snapshot_database()
+        with CaptureQueriesContext(connection) as captured:
+            list(GFKCompositeTarget.objects.filter(attachments__text="apple"))
+            list(GFKCompositeTarget.objects.exclude(attachments__text="apple"))
+            GFKCompositeTarget.objects.filter(
+                attachments__text__startswith="a"
+            ).distinct().count()
+            list(GFKCompositeTarget.objects.prefetch_related("attachments"))
+            list(GFKCompositeAttachment.objects.prefetch_related("content_object"))
+        for query in captured.captured_queries:
+            self.assertFalse(
+                query["sql"]
+                .lstrip("(")
+                .upper()
+                .startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP")),
+                query["sql"],
+            )
+        self.assertEqual(self._snapshot_database(), before)
+
+    def test_delete_source_updates_query_results(self):
+        self.source_apple.delete()
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text="apple")),
+            [],
+        )
+        # target_a still matches through its remaining source.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__text__startswith="a"
+                ).distinct()
+            ),
+            [self.target_a],
+        )
+        self.assertTrue(
+            GFKCompositeTarget.objects.filter(pk=self.target_a.pk).exists()
+        )
+
+    def test_delete_target_cascades_only_to_its_sources(self):
+        self.target_a.delete()
+        self.assertFalse(
+            GFKCompositeAttachment.objects.filter(
+                pk__in=[self.source_apple.pk, self.source_apricot.pk]
+            ).exists()
+        )
+        self.assertTrue(
+            GFKCompositeAttachment.objects.filter(pk=self.source_banana.pk).exists()
+        )
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text="banana")),
+            [self.target_b],
+        )
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(attachments__text="banana"),
+            [self.target_c],
+        )
+
+
+class SinglePKGenericRelationQueryTestCase(TestCase):
+    """Single-field primary key generic relation queries are unchanged."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.question = Question.objects.create(text="q")
+        cls.other_question = Question.objects.create(text="other")
+        cls.answer_a = Answer.objects.create(text="apple", question=cls.question)
+        cls.answer_b = Answer.objects.create(text="apricot", question=cls.question)
+
+    def test_filter_dedup_count_and_prefetch(self):
+        qs = Question.objects.filter(answer_set__text__startswith="a").distinct()
+        self.assertEqual(list(qs), [self.question])
+        self.assertEqual(qs.count(), 1)
+        questions = list(
+            Question.objects.prefetch_related("answer_set").order_by("pk")
+        )
+        self.assertCountEqual(
+            questions[0].answer_set.all(), [self.answer_a, self.answer_b]
+        )
+        self.assertEqual(list(questions[1].answer_set.all()), [])
+
+    def test_exclude(self):
+        self.assertEqual(
+            list(Question.objects.exclude(answer_set__text="apple")),
+            [self.other_question],
+        )

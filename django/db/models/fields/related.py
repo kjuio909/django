@@ -449,6 +449,17 @@ class RelatedField(FieldCacheMixin, Field):
             return base_q & descriptor_filter
         return base_q
 
+    def get_exclude_correlation_lookup(self, select_field, col, trimmed_prefix):
+        """
+        Return a lookup correlating the select column ``col`` (of
+        ``select_field``) of a trimmed exclude() subquery with the outer
+        query's ``trimmed_prefix`` path.
+        """
+        from django.db.models.expressions import ResolvedOuterRef
+
+        lookup_class = select_field.get_lookup("exact")
+        return lookup_class(col, ResolvedOuterRef(trimmed_prefix))
+
     @property
     def swappable_setting(self):
         """

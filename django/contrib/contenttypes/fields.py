@@ -15,14 +15,17 @@ from django.core.exceptions import (
 from django.db import DEFAULT_DB_ALIAS, models, router, transaction
 from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
 from django.db.models.base import ModelBase, make_foreign_order_accessors
+from django.db.models.constants import LOOKUP_SEP
 from django.db.models.deletion import DatabaseOnDelete
-from django.db.models.fields import Field
+from django.db.models.expressions import Func, ResolvedOuterRef, Value
+from django.db.models.fields import Field, TextField
 from django.db.models.fields.composite import CompositePrimaryKey
 from django.db.models.fields.mixins import FieldCacheMixin
 from django.db.models.fields.related import (
     ReverseManyToOneDescriptor,
     lazy_related_operation,
 )
+from django.db.models.functions import Concat
 from django.db.models.query import prefetch_related_objects
 from django.db.models.query_utils import PathInfo
 from django.db.models.sql import AND
@@ -35,6 +38,45 @@ from django.utils.functional import cached_property
 # be decoded. It's an object instance (never produced by to_python()), so the
 # key can't collide with a real composite primary key.
 INVALID_COMPOSITE_REFERENCE = object()
+
+
+class JSONQuote(Func):
+    """
+    Return the JSON text representation of a single SQL value, matching
+    json.dumps() for that value (e.g. 1 -> 1, "x" -> "\"x\"").
+    """
+
+    function = "JSON_QUOTE"
+    arity = 1
+    output_field = TextField()
+
+    def as_mysql(self, compiler, connection, **extra_context):
+        # MySQL's JSON_QUOTE() quotes its argument as a string, while
+        # CAST(... AS JSON) preserves the JSON type of the value.
+        return self.as_sql(
+            compiler, connection, template="CAST(%(expressions)s AS JSON)",
+            **extra_context,
+        )
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        return self.as_sql(
+            compiler, connection, function="TO_JSON", **extra_context
+        )
+
+
+def encode_composite_reference(expressions):
+    """
+    Return an expression evaluating to the JSON array text produced by
+    GenericForeignKey.encode_composite_pk() for the given SQL expressions,
+    so that a stored reference can be matched with a database-level join.
+    """
+    parts = [Value("[")]
+    for index, expression in enumerate(expressions):
+        if index:
+            parts.append(Value(", "))
+        parts.append(JSONQuote(expression))
+    parts.append(Value("]"))
+    return Concat(*parts, output_field=TextField())
 
 
 class GenericForeignKey(FieldCacheMixin, Field):
@@ -750,11 +792,63 @@ class GenericRelation(ForeignObject):
             self.model, for_concrete_model=self.for_concrete_model
         )
 
+    def get_joining_fields(self, reverse_join=False):
+        if isinstance(self.model._meta.pk, CompositePrimaryKey):
+            # A reference to a composite primary key is stored as JSON array
+            # text in the single object_id column, so there are no column
+            # pairs to equate; get_extra_restriction() provides the join
+            # condition instead.
+            return ()
+        return super().get_joining_fields(reverse_join=reverse_join)
+
+    def get_exclude_correlation_lookup(self, select_field, col, trimmed_prefix):
+        pk = self.model._meta.pk
+        object_id_field = self.remote_field.model._meta.get_field(
+            self.object_id_field_name
+        )
+        is_stored_reference = (
+            isinstance(pk, CompositePrimaryKey) and select_field is object_id_field
+        )
+        if not is_stored_reference:
+            return super().get_exclude_correlation_lookup(
+                select_field, col, trimmed_prefix
+            )
+        # The trimmed subquery selects the stored JSON array text reference;
+        # correlate it with the encoding of the outer query's primary key
+        # components, resolved along the same path as trimmed_prefix.
+        prefix, _, _ = trimmed_prefix.rpartition(LOOKUP_SEP)
+        reference = encode_composite_reference(
+            [
+                ResolvedOuterRef(
+                    f"{prefix}{LOOKUP_SEP}{field.name}" if prefix else field.name
+                )
+                for field in pk.fields
+            ]
+        )
+        return select_field.get_lookup("exact")(col, reference)
+
     def get_extra_restriction(self, alias, remote_alias):
         field = self.remote_field.model._meta.get_field(self.content_type_field_name)
         contenttype_pk = self.get_content_type().pk
         lookup = field.get_lookup("exact")(field.get_col(remote_alias), contenttype_pk)
-        return WhereNode([lookup], connector=AND)
+        conditions = [lookup]
+        pk = self.model._meta.pk
+        if isinstance(pk, CompositePrimaryKey) and alias is not None:
+            # Match the stored JSON array text reference against the encoding
+            # of this model's primary key columns. A reference that isn't a
+            # well-formed encoding simply never compares equal.
+            object_id_field = self.remote_field.model._meta.get_field(
+                self.object_id_field_name
+            )
+            reference = encode_composite_reference(
+                [component.get_col(alias) for component in pk.fields]
+            )
+            conditions.append(
+                object_id_field.get_lookup("exact")(
+                    object_id_field.get_col(remote_alias), reference
+                )
+            )
+        return WhereNode(conditions, connector=AND)
 
     def bulk_related_objects(self, objs, using=DEFAULT_DB_ALIAS):
         """

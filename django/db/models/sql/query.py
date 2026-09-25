@@ -30,7 +30,6 @@ from django.db.models.expressions import (
     OuterRef,
     RawSQL,
     Ref,
-    ResolvedOuterRef,
     Value,
 )
 from django.db.models.fields import Field
@@ -2140,10 +2139,10 @@ class Query(BaseExpression):
         query.clear_ordering(force=True)
         # Try to have as simple as possible subquery -> trim leading joins from
         # the subquery.
-        trimmed_prefix, contains_louter = query.trim_start(names_with_path)
+        trimmed_prefix, contains_louter, join_field = query.trim_start(names_with_path)
 
         col = query.select[0]
-        select_field = col.target
+        select_field = col.output_field
         alias = col.alias
         if alias in can_reuse:
             pk = select_field.model._meta.pk
@@ -2157,8 +2156,9 @@ class Query(BaseExpression):
             query.where.add(lookup, AND)
             query.external_aliases[alias] = True
         else:
-            lookup_class = select_field.get_lookup("exact")
-            lookup = lookup_class(col, ResolvedOuterRef(trimmed_prefix))
+            lookup = join_field.get_exclude_correlation_lookup(
+                select_field, col, trimmed_prefix
+            )
             query.where.add(lookup, AND)
 
         condition, needed_inner = self.build_filter(Exists(query))
@@ -2703,9 +2703,9 @@ class Query(BaseExpression):
         This method is meant to be used for generating the subquery joins &
         cols in split_exclude().
 
-        Return a lookup usable for doing outerq.filter(lookup=self) and a
+        Return a lookup usable for doing outerq.filter(lookup=self), a
         boolean indicating if the joins in the prefix contain a LEFT OUTER
-        join.
+        join, and the field joining the trimmed relation.
         """
         all_paths = []
         for _, paths in names_with_path:
@@ -2770,7 +2770,7 @@ class Query(BaseExpression):
                 )
                 break
         self.set_select([f.get_col(select_alias) for f in select_fields])
-        return trimmed_prefix, contains_louter
+        return trimmed_prefix, contains_louter, join_field
 
     def is_nullable(self, field):
         """
