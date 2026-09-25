@@ -60,9 +60,14 @@ A composite primary key can also be filtered by a ``tuple``:
     1
 
 We're still working on composite primary key support for
-:ref:`relational fields <cpk-and-relations>` and
-:class:`.GenericForeignKey` fields. You can expect to see this in future
-releases.
+:ref:`relational fields <cpk-and-relations>`. You can expect to see this in
+future releases.
+
+:class:`~django.contrib.contenttypes.fields.GenericForeignKey` does support
+models with a composite primary key. The reference is stored in the object ID
+field as a JSON array text in the primary key field's declaration order, with
+each element normalized with the corresponding component field's
+``to_python()``.
 
 Models with composite primary keys can be registered with the
 :class:`~django.contrib.admin.ModelAdmin`. Each part of the key is quoted and
@@ -98,9 +103,16 @@ operation.
 Composite primary keys and relations
 ====================================
 
-:ref:`Relationship fields <relationship-fields>`, including
-:ref:`generic relations <generic-relations>` do not support composite primary
-keys.
+:ref:`Relationship fields <relationship-fields>`, such as ``ForeignKey`` do
+not support composite primary keys.
+
+:class:`~django.contrib.contenttypes.fields.GenericForeignKey` and
+:class:`~django.contrib.contenttypes.fields.GenericRelation` do support
+models with a composite primary key; the reference to such an object is
+persisted as a JSON array text. SQL-level joins through the generic relation
+(e.g. querying the target model with a filter on the related objects) aren't
+supported yet, but assignment, direct access, prefetching, querying by the
+stored reference, and cascading deletions all work.
 
 For example, given the ``OrderLineItem`` model, the following is not
 supported::

@@ -1,17 +1,23 @@
 import functools
 import itertools
+import json
 from collections import defaultdict
 
 from asgiref.sync import sync_to_async
 
 from django.contrib.contenttypes.models import ContentType
 from django.core import checks
-from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    ObjectDoesNotExist,
+    ValidationError,
+)
 from django.db import DEFAULT_DB_ALIAS, models, router, transaction
 from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
 from django.db.models.base import ModelBase, make_foreign_order_accessors
 from django.db.models.deletion import DatabaseOnDelete
 from django.db.models.fields import Field
+from django.db.models.fields.composite import CompositePrimaryKey
 from django.db.models.fields.mixins import FieldCacheMixin
 from django.db.models.fields.related import (
     ReverseManyToOneDescriptor,
@@ -23,6 +29,12 @@ from django.db.models.sql import AND
 from django.db.models.sql.where import WhereNode
 from django.db.models.utils import AltersData
 from django.utils.functional import cached_property
+
+
+# Sentinel used as part of a prefetch match key for a reference that couldn't
+# be decoded. It's an object instance (never produced by to_python()), so the
+# key can't collide with a real composite primary key.
+INVALID_COMPOSITE_REFERENCE = object()
 
 
 class GenericForeignKey(FieldCacheMixin, Field):
@@ -69,8 +81,12 @@ class GenericForeignKey(FieldCacheMixin, Field):
 
     def get_forward_related_filter(self, obj):
         """See corresponding method on RelatedField"""
+        fk_value = obj.pk
+        pk_field = obj._meta.pk
+        if isinstance(pk_field, CompositePrimaryKey):
+            fk_value = self.encode_composite_pk(pk_field, fk_value)
         return {
-            self.fk_field: obj.pk,
+            self.fk_field: fk_value,
             self.ct_field: ContentType.objects.get_for_model(obj).pk,
         }
 
@@ -172,6 +188,88 @@ class GenericForeignKey(FieldCacheMixin, Field):
             # This should never happen. I love comments like this, don't you?
             raise Exception("Impossible arguments to GFK.get_content_type!")
 
+    @staticmethod
+    def encode_composite_pk(pk_field, pk):
+        """
+        Encode a composite primary key as a JSON array string, using the
+        declaration order of the key's fields. Each element is converted with
+        the corresponding component field's to_python() and normalized with
+        get_prep_value(), so it round-trips losslessly through JSON. None is
+        preserved as JSON null and can never be confused with the string
+        "None", an empty string, or a missing element.
+        """
+        values = [
+            None if value is None else field.get_prep_value(field.to_python(value))
+            for field, value in zip(pk_field.fields, pk)
+        ]
+        try:
+            return json.dumps(values, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Composite primary key has an unencodable component."
+            ) from exc
+
+    @staticmethod
+    def decode_composite_pk(pk_field, value):
+        """
+        Decode a JSON array string produced by encode_composite_pk() back into
+        a tuple of values converted with the component fields' to_python().
+
+        Each JSON element must already be in the field's canonical form: e.g.
+        a JSON number may not stand in for a CharField component (so the
+        integer 1 and the string "1" can't be confused), and a JSON string
+        may not stand in for an IntegerField component.
+
+        Raise ValueError if the value isn't a JSON array, if its length
+        doesn't match the composite key, if an element has the wrong JSON
+        type, or if a component can't be converted.
+        """
+        try:
+            raw_values = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Malformed composite primary key reference.") from exc
+        if not isinstance(raw_values, list):
+            raise ValueError("Composite primary key reference must be a JSON array.")
+        fields = pk_field.fields
+        if len(raw_values) != len(fields):
+            raise ValueError(
+                "Composite primary key reference has the wrong number of components."
+            )
+        values = []
+        for field, raw in zip(fields, raw_values):
+            if raw is None:
+                values.append(None)
+                continue
+            try:
+                converted = field.to_python(raw)
+                # The element must already be in canonical form, so a value of
+                # the wrong JSON type can't be coerced into a match.
+                canonical = field.get_prep_value(converted)
+                if json.dumps(canonical, ensure_ascii=False) != json.dumps(
+                    raw, ensure_ascii=False
+                ):
+                    raise ValueError
+                values.append(converted)
+            except (ValidationError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Composite primary key reference has an invalid component."
+                ) from exc
+        return tuple(values)
+
+    def composite_pk_filter(self, pk_field, pk_value):
+        """
+        Return a Q object matching the composite primary key ``pk_value``,
+        using IS NULL for components that are None (a tuple comparison against
+        NULL would never match).
+        """
+        conditions = models.Q()
+        for field, value in zip(pk_field.fields, pk_value):
+            if value is None:
+                conditions &= models.Q(**{field.name + "__isnull": True})
+            else:
+                conditions &= models.Q(**{field.name: value})
+        return conditions
+
 
 class GenericForeignKeyDescriptor:
     def __init__(self, field):
@@ -179,6 +277,16 @@ class GenericForeignKeyDescriptor:
 
     def is_cached(self, instance):
         return self.field.is_cached(instance)
+
+    def _decode_reference(self, pk_field, fk_val):
+        """
+        Decode a stored reference into a hashable, to_python()-normalized key
+        for a composite primary key. Return None for a malformed reference.
+        """
+        try:
+            return GenericForeignKey.decode_composite_pk(pk_field, fk_val)
+        except (TypeError, ValueError):
+            return None
 
     def get_prefetch_querysets(self, instances, querysets=None):
         custom_queryset_dict = {}
@@ -212,10 +320,34 @@ class GenericForeignKeyDescriptor:
         for ct_id, fkeys in fk_dict.items():
             if ct_id in custom_queryset_dict:
                 # Return values from the custom queryset, if provided.
-                queryset = custom_queryset_dict[ct_id].filter(pk__in=fkeys)
+                queryset = custom_queryset_dict[ct_id]
+                model = queryset.model
             else:
                 instance = instance_dict[ct_id]
                 ct = self.field.get_content_type(id=ct_id, using=instance._state.db)
+                model = ct.model_class()
+                queryset = model._base_manager.using(instance._state.db)
+
+            pk_field = model._meta.pk
+            if isinstance(pk_field, CompositePrimaryKey):
+                # Decode every reference; malformed ones can't match anything.
+                conditions = []
+                for fkey in fkeys:
+                    decoded = self._decode_reference(pk_field, fkey)
+                    if decoded is not None:
+                        conditions.append(
+                            self.field.composite_pk_filter(pk_field, decoded)
+                        )
+                if conditions:
+                    query = conditions[0]
+                    for condition in conditions[1:]:
+                        query |= condition
+                    queryset = queryset.filter(query)
+                else:
+                    queryset = queryset.none()
+            elif ct_id in custom_queryset_dict:
+                queryset = queryset.filter(pk__in=fkeys)
+            else:
                 queryset = ct.get_all_objects_for_this_type(pk__in=fkeys)
 
             ret_val.extend(queryset.fetch_mode(instances[0]._state.fetch_mode))
@@ -228,14 +360,33 @@ class GenericForeignKeyDescriptor:
             if ct_id is None:
                 return None
             else:
-                model = self.field.get_content_type(
-                    id=ct_id, using=obj._state.db
-                ).model_class()
-                return str(getattr(obj, self.field.fk_field)), model
+                ct = self.field.get_content_type(id=ct_id, using=obj._state.db)
+                model = ct.model_class()
+                fk_val = getattr(obj, self.field.fk_field)
+                pk_field = model._meta.pk
+                if isinstance(pk_field, CompositePrimaryKey):
+                    decoded = self._decode_reference(pk_field, fk_val)
+                    if decoded is None:
+                        # A malformed reference can never match a real object.
+                        return (INVALID_COMPOSITE_REFERENCE, fk_val), model
+                    return decoded, model
+                return str(fk_val), model
+
+        def rel_obj_key(obj):
+            pk_field = obj._meta.pk
+            if isinstance(pk_field, CompositePrimaryKey):
+                return (
+                    tuple(
+                        field.to_python(value)
+                        for field, value in zip(pk_field.fields, obj.pk)
+                    ),
+                    obj.__class__,
+                )
+            return (pk_field.value_to_string(obj), obj.__class__)
 
         return (
             ret_val,
-            lambda obj: (obj._meta.pk.value_to_string(obj), obj.__class__),
+            rel_obj_key,
             gfk_key,
             True,
             self.field.name,
@@ -262,14 +413,24 @@ class GenericForeignKeyDescriptor:
                 ct_id
                 == self.field.get_content_type(obj=rel_obj, using=instance._state.db).id
             )
-            pk_match = ct_match and rel_obj._meta.pk.to_python(pk_val) == rel_obj.pk
-            if pk_match:
+            if ct_match and self._cached_object_matches(rel_obj, pk_val):
                 return rel_obj
             else:
                 rel_obj = None
 
         instance._state.fetch_mode.fetch(self, instance)
         return self.field.get_cached_value(instance)
+
+    def _cached_object_matches(self, rel_obj, pk_val):
+        pk_field = rel_obj._meta.pk
+        if isinstance(pk_field, CompositePrimaryKey):
+            try:
+                return GenericForeignKey.decode_composite_pk(pk_field, pk_val) == tuple(
+                    rel_obj.pk
+                )
+            except (TypeError, ValueError):
+                return False
+        return pk_field.to_python(pk_val) == rel_obj.pk
 
     def fetch_one(self, instance):
         f = self.field.model._meta.get_field(self.field.ct_field)
@@ -278,13 +439,27 @@ class GenericForeignKeyDescriptor:
         rel_obj = None
         if ct_id is not None:
             ct = self.field.get_content_type(id=ct_id, using=instance._state.db)
-            try:
-                rel_obj = ct.get_object_for_this_type(
-                    using=instance._state.db, pk=pk_val
-                )
-            except ObjectDoesNotExist:
-                pass
+            model = ct.model_class()
+            pk_field = model._meta.pk
+            if isinstance(pk_field, CompositePrimaryKey):
+                decoded = self._decode_reference(pk_field, pk_val)
+                if decoded is not None:
+                    try:
+                        rel_obj = (
+                            model._base_manager.using(instance._state.db)
+                            .filter(self.field.composite_pk_filter(pk_field, decoded))
+                            .get()
+                        )
+                    except ObjectDoesNotExist:
+                        rel_obj = None
             else:
+                try:
+                    rel_obj = ct.get_object_for_this_type(
+                        using=instance._state.db, pk=pk_val
+                    )
+                except ObjectDoesNotExist:
+                    pass
+            if rel_obj is not None:
                 rel_obj._state.fetch_mode = instance._state.fetch_mode
         self.field.set_cached_value(instance, rel_obj)
 
@@ -297,8 +472,18 @@ class GenericForeignKeyDescriptor:
         ct = None
         fk = None
         if value is not None:
+            pk_field = value._meta.pk
+            if isinstance(pk_field, CompositePrimaryKey):
+                if value._state.adding:
+                    raise ValueError(
+                        "Cannot assign an unsaved object to a GenericForeignKey."
+                    )
+                # Encode before touching anything else; an unencodable
+                # component must leave the instance attributes untouched.
+                fk = GenericForeignKey.encode_composite_pk(pk_field, value.pk)
+            else:
+                fk = value.pk
             ct = self.field.get_content_type(obj=value)
-            fk = value.pk
 
         setattr(instance, self.field.ct_field, ct)
         setattr(instance, self.field.fk_field, fk)
@@ -575,13 +760,19 @@ class GenericRelation(ForeignObject):
         """
         Return all objects related to ``objs`` via this ``GenericRelation``.
         """
+        pks = []
+        for obj in objs:
+            pk = obj.pk
+            if isinstance(obj._meta.pk, CompositePrimaryKey):
+                pk = GenericForeignKey.encode_composite_pk(obj._meta.pk, pk)
+            pks.append(pk)
         return self.remote_field.model._base_manager.db_manager(using).filter(
             **{
                 "%s__pk"
                 % self.content_type_field_name: ContentType.objects.db_manager(using)
                 .get_for_model(self.model, for_concrete_model=self.for_concrete_model)
                 .pk,
-                "%s__in" % self.object_id_field_name: [obj.pk for obj in objs],
+                "%s__in" % self.object_id_field_name: pks,
             }
         )
 
@@ -630,6 +821,11 @@ def create_generic_related_manager(superclass, rel):
             self.object_id_field_name = rel.field.object_id_field_name
             self.prefetch_cache_name = rel.field.attname
             self.pk_val = instance.pk
+            if isinstance(instance._meta.pk, CompositePrimaryKey):
+                # The reference is stored as a JSON array text.
+                self.pk_val = GenericForeignKey.encode_composite_pk(
+                    instance._meta.pk, instance.pk
+                )
 
             self.core_filters = {
                 "%s__pk" % self.content_type_field_name: self.content_type.id,
@@ -685,12 +881,24 @@ def create_generic_related_manager(superclass, rel):
                 queryset = super().get_queryset()._disable_cloning()
             queryset._add_hints(instance=instances[0])
             queryset = queryset.using(queryset._db or self._db)
+            pk_field = instances[0]._meta.pk
+            is_composite = isinstance(pk_field, CompositePrimaryKey)
+
+            def instance_ref(obj):
+                pk = obj.pk
+                if is_composite:
+                    return GenericForeignKey.encode_composite_pk(obj._meta.pk, pk)
+                return pk
+
             # Group instances by content types.
             content_type_queries = [
                 models.Q.create(
                     [
                         (f"{self.content_type_field_name}__pk", content_type_id),
-                        (f"{self.object_id_field_name}__in", {obj.pk for obj in objs}),
+                        (
+                            f"{self.object_id_field_name}__in",
+                            {instance_ref(obj) for obj in objs},
+                        ),
                     ]
                 )
                 for content_type_id, objs in itertools.groupby(
@@ -699,9 +907,15 @@ def create_generic_related_manager(superclass, rel):
                 )
             ]
             query = models.Q.create(content_type_queries, connector=models.Q.OR)
-            # We (possibly) need to convert object IDs to the type of the
-            # instances' PK in order to match up instances:
-            object_id_converter = instances[0]._meta.pk.to_python
+
+            def object_id_converter(value):
+                if is_composite:
+                    try:
+                        return GenericForeignKey.decode_composite_pk(pk_field, value)
+                    except (TypeError, ValueError):
+                        return value
+                return pk_field.to_python(value)
+
             content_type_id_field_name = "%s_id" % self.content_type_field_name
             queryset = queryset.filter(query)
             # Restore subsequent cloning operations.
@@ -713,7 +927,10 @@ def create_generic_related_manager(superclass, rel):
                     object_id_converter(getattr(relobj, self.object_id_field_name)),
                     getattr(relobj, content_type_id_field_name),
                 ),
-                lambda obj: (obj.pk, self.get_content_type(obj).pk),
+                lambda obj: (
+                    object_id_converter(instance_ref(obj)),
+                    self.get_content_type(obj).pk,
+                ),
                 False,
                 self.prefetch_cache_name,
                 False,

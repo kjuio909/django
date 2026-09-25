@@ -120,3 +120,23 @@ class UUIDModel(models.Model):
 
     def get_absolute_url(self):
         return "/uuid/%s/" % self.pk
+
+
+class GFKCompositeTarget(models.Model):
+    pk = models.CompositePrimaryKey("code", "tenant")
+    code = models.SmallIntegerField()
+    tenant = models.CharField(max_length=50)
+    attachments = GenericRelation("GFKCompositeAttachment")
+
+
+class GFKCompositeDateTarget(models.Model):
+    pk = models.CompositePrimaryKey("id", "day")
+    id = models.SmallIntegerField()
+    day = models.DateField()
+
+
+class GFKCompositeAttachment(models.Model):
+    text = models.CharField(max_length=100, default="", blank=True)
+    content_type = models.ForeignKey(ContentType, models.CASCADE, null=True)
+    object_id = models.TextField(null=True)
+    content_object = GenericForeignKey()
