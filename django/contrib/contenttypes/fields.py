@@ -914,17 +914,197 @@ def create_generic_related_manager(superclass, rel):
             self.content_type_field_name = rel.field.content_type_field_name
             self.object_id_field_name = rel.field.object_id_field_name
             self.prefetch_cache_name = rel.field.attname
-            self.pk_val = instance.pk
-            if isinstance(instance._meta.pk, CompositePrimaryKey):
-                # The reference is stored as a JSON array text.
+            pk_field = instance._meta.pk
+            self.is_composite_pk = isinstance(pk_field, CompositePrimaryKey)
+            if self.is_composite_pk:
+                # The reference is stored as JSON array text. Encode it while
+                # building the manager: an unencodable component must prevent
+                # the relationship from being read or mutated.
                 self.pk_val = GenericForeignKey.encode_composite_pk(
-                    instance._meta.pk, instance.pk
+                    pk_field, instance.pk
                 )
+            else:
+                self.pk_val = instance.pk
+            self.content_type_attname = rel.model._meta.get_field(
+                rel.field.content_type_field_name
+            ).attname
 
             self.core_filters = {
                 "%s__pk" % self.content_type_field_name: self.content_type.id,
                 self.object_id_field_name: self.pk_val,
             }
+
+        def _check_target(self):
+            """
+            Ensure the composite-primary-key target instance has been saved and
+            still exists. Mutating the relationship of an unsaved or deleted
+            target would store a reference that can never resolve.
+            """
+            if not self.is_composite_pk:
+                return
+            if self.instance._state.adding or not self.instance._is_pk_set():
+                raise ValueError(
+                    f"{self.instance._meta.object_name!r} instance needs to have "
+                    "a primary key value before this relationship can be used."
+                )
+            db = router.db_for_read(
+                self.instance.__class__, instance=self.instance
+            )
+            if not self.instance.__class__._base_manager.using(db).filter(
+                pk=self.instance.pk
+            ).exists():
+                raise self.instance.DoesNotExist(
+                    "%r with the composite primary key %r does not exist."
+                    % (self.instance, self.pk_val)
+                )
+
+        def _source_rows(self, objs, db):
+            """
+            Return a mapping of source primary key to the
+            (content type id, object id) pair currently stored for each of
+            ``objs`` that exists. Sources are read from their own database,
+            which matters for bulk=False where related objects may live on a
+            different database than the target.
+            """
+            objs_by_db = defaultdict(list)
+            for obj in objs:
+                objs_by_db[obj._state.db or db].append(obj)
+            current = {}
+            for using, using_objs in objs_by_db.items():
+                pks = {obj.pk for obj in using_objs}
+                rows = (
+                    self.model._base_manager.using(using)
+                    .filter(pk__in=pks)
+                    .only(self.content_type_field_name, self.object_id_field_name)
+                )
+                for row in rows:
+                    current[row.pk] = (
+                        getattr(row, self.content_type_attname),
+                        getattr(row, self.object_id_field_name),
+                    )
+            return current
+
+        def _check_source_instances(self, objs, db, *, saved_only):
+            """Validate the source instances before any database write."""
+            for obj in objs:
+                if not isinstance(obj, self.model):
+                    raise TypeError(
+                        "'%s' instance expected, got %r"
+                        % (self.model._meta.object_name, obj)
+                    )
+                if saved_only and (obj._state.adding or obj._state.db != db):
+                    raise ValueError(
+                        "%r instance isn't saved. Use bulk=False or save "
+                        "the object first." % obj
+                    )
+
+        def _decode_source_reference(self, object_id):
+            """
+            Decode a source's stored reference to this composite target.
+            Return None for a missing reference; raise ValueError if the
+            content type matches but the object identifier isn't a valid
+            reference to this model.
+            """
+            if object_id is None:
+                return None
+            try:
+                return GenericForeignKey.decode_composite_pk(
+                    self.instance._meta.pk, object_id
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "%r has an invalid composite primary key reference %r."
+                    % (self.model._meta.object_name, object_id)
+                ) from exc
+
+        def _validate_sources_for_add(self, objs, db):
+            """
+            Validate all sources for an add before anything is written.
+
+            Return the set of primary keys that must be updated. A source is
+            skipped (add stays idempotent) when it already points at this
+            target. A source pointing at another object of the same content
+            type is reassigned (standard ``add()`` semantics); a source with
+            another content type or an unreadable reference is rejected.
+
+            Saved-state and database validity are the caller's responsibility
+            (bulk=False may receive unsaved or cross-database objects).
+            """
+            self._check_source_instances(objs, db, saved_only=False)
+            current = self._source_rows(objs, db)
+            update_pks = set()
+            for obj in objs:
+                if obj.pk not in current:
+                    raise ValueError(
+                        "%r instance isn't saved. Use bulk=False or save the "
+                        "object first." % obj
+                    )
+                content_type_id, object_id = current[obj.pk]
+                if content_type_id == self.content_type.id and object_id == self.pk_val:
+                    continue
+                if content_type_id is None and object_id is None:
+                    update_pks.add(obj.pk)
+                    continue
+                if content_type_id is None or content_type_id != self.content_type.id:
+                    raise ValueError(
+                        "%r has a different content type and cannot be assigned "
+                        "to %r." % (obj, self.instance)
+                    )
+                if object_id is None:
+                    # A content type without an object identifier is a dangling
+                    # (unresolved) reference; assigning the source repairs it.
+                    update_pks.add(obj.pk)
+                    continue
+                # Validate the stored reference: same content type with an
+                # unreadable object identifier is an invalid source and fails
+                # the whole operation. A valid reference to another object of
+                # this content type is reassigned, which is the documented
+                # add() behavior.
+                self._decode_source_reference(object_id)
+                update_pks.add(obj.pk)
+            return update_pks
+
+        def _validate_sources_for_remove(self, objs, db):
+            """
+            Validate all sources for a remove before anything is deleted.
+
+            Only sources currently related to this target (full composite key
+            match) are returned for deletion. Sources related to another
+            target are ignored (removing a source that isn't part of the
+            relation is a no-op); unsaved sources, sources with another
+            content type or an object identifier that isn't a valid JSON
+            reference are rejected so they can never be modified.
+            """
+            self._check_source_instances(objs, db, saved_only=True)
+            current = self._source_rows(objs, db)
+            remove_pks = set()
+            for obj in objs:
+                if obj.pk not in current:
+                    # The row no longer exists (e.g. it was already removed):
+                    # removing a saved source that isn't there is a no-op.
+                    continue
+                content_type_id, object_id = current[obj.pk]
+                if content_type_id is None:
+                    continue
+                if content_type_id != self.content_type.id:
+                    raise ValueError(
+                        "%r has a different content type and cannot be removed "
+                        "from %r." % (obj, self.instance)
+                    )
+                if object_id == self.pk_val:
+                    remove_pks.add(obj.pk)
+                else:
+                    # A well-formed reference to another target simply isn't
+                    # part of this relation; a malformed reference is invalid
+                    # input and must fail the whole operation.
+                    self._decode_source_reference(object_id)
+            return remove_pks
+
+        def _assign_to_target(self, objs):
+            """Point the given in-memory sources at this target."""
+            for obj in objs:
+                setattr(obj, self.content_type_field_name, self.content_type)
+                setattr(obj, self.object_id_field_name, self.pk_val)
 
         def __call__(self, *, manager):
             manager = getattr(self.model, manager)
@@ -1043,6 +1223,10 @@ def create_generic_related_manager(superclass, rel):
                 setattr(obj, self.content_type_field_name, self.content_type)
                 setattr(obj, self.object_id_field_name, self.pk_val)
 
+            if self.is_composite_pk:
+                self._composite_add(objs, db, bulk)
+                return
+
             if bulk:
                 pks = []
                 for obj in objs:
@@ -1066,6 +1250,60 @@ def create_generic_related_manager(superclass, rel):
                         check_and_update_obj(obj)
                         obj.save()
 
+        def _composite_write_add(self, objs, db, bulk):
+            """
+            Point already-validated sources at this target.
+
+            With bulk=True the sources are reassigned with one bulk update.
+            With bulk=False every source is saved individually (inserting
+            unsaved ones and updating saved ones), matching the historical
+            bulk=False behavior, including for objects on another database.
+            """
+            if not objs:
+                return
+            if bulk:
+                update_pks = {obj.pk for obj in objs}
+                self.model._base_manager.using(db).filter(pk__in=update_pks).update(
+                    **{
+                        self.content_type_field_name: self.content_type,
+                        self.object_id_field_name: self.pk_val,
+                    }
+                )
+            else:
+                for obj in objs:
+                    self._assign_to_target([obj])
+                    obj.save()
+
+        def _composite_add(self, objs, db, bulk):
+            """
+            Validate every source before writing, then point all of them at
+            this target in a single atomic operation. Re-adding a source that
+            already belongs to this target is a no-op; unsaved sources (with
+            bulk=True), sources with another content type or an unreadable
+            object identifier fail the operation before a single row is
+            touched.
+            """
+            self._check_target()
+            if not objs:
+                return
+            self._check_source_instances(objs, db, saved_only=bulk)
+            unsaved_objs = tuple(obj for obj in objs if obj._state.adding)
+            saved_objs = tuple(obj for obj in objs if not obj._state.adding)
+            # Read-only validation of every saved source first.
+            update_pks = self._validate_sources_for_add(saved_objs, db)
+            write_saved = tuple(obj for obj in saved_objs if obj.pk in update_pks)
+            write_objs = write_saved if bulk else (*write_saved, *unsaved_objs)
+            if write_objs:
+                if bulk:
+                    # A single bulk update is atomic on its own.
+                    self._composite_write_add(write_objs, db, bulk)
+                else:
+                    with transaction.atomic(using=db, savepoint=False):
+                        self._composite_write_add(write_objs, db, bulk)
+            # The sources are mutated in memory after the write, once it is
+            # known the whole operation succeeded.
+            self._assign_to_target(write_saved if bulk else objs)
+
         add.alters_data = True
 
         async def aadd(self, *objs, bulk=True):
@@ -1075,6 +1313,15 @@ def create_generic_related_manager(superclass, rel):
 
         def remove(self, *objs, bulk=True):
             if not objs:
+                return
+            if self.is_composite_pk:
+                db = router.db_for_write(self.model, instance=self.instance)
+                self._check_target()
+                # Validate every source before deleting anything. QuerySet
+                # delete() (or the per-object loop below) is atomic itself.
+                remove_pks = self._validate_sources_for_remove(objs, db)
+                if remove_pks:
+                    self._clear(self.using(db).filter(pk__in=remove_pks), bulk)
                 return
             self._clear(self.filter(pk__in=[o.pk for o in objs]), bulk)
 
@@ -1086,6 +1333,8 @@ def create_generic_related_manager(superclass, rel):
         aremove.alters_data = True
 
         def clear(self, *, bulk=True):
+            if self.is_composite_pk:
+                self._check_target()
             self._clear(self, bulk)
 
         clear.alters_data = True
@@ -1110,12 +1359,63 @@ def create_generic_related_manager(superclass, rel):
 
         _clear.alters_data = True
 
+        def _composite_set(self, objs, db, bulk, clear):
+            """
+            Validate the whole replacement before writing anything, then
+            delete the sources that leave the relation and point the new
+            sources at this target in a single transaction.
+            """
+            self._check_target()
+            self._check_source_instances(objs, db, saved_only=bulk)
+            unsaved_objs = tuple(obj for obj in objs if obj._state.adding)
+            saved_objs = tuple(obj for obj in objs if not obj._state.adding)
+            # Read-only validation of the new sources happens before any row
+            # is deleted, so a failure can never leave a partially replaced
+            # relation.
+            update_pks = self._validate_sources_for_add(saved_objs, db)
+            write_saved = tuple(obj for obj in saved_objs if obj.pk in update_pks)
+            with transaction.atomic(using=db, savepoint=False):
+                if clear:
+                    # Remove every current source except those that are part
+                    # of the replacement set; deleting those first would make
+                    # it impossible to re-add them in the same operation.
+                    keep_pks = {obj.pk for obj in saved_objs}
+                    stale = self.using(db)
+                    if keep_pks:
+                        stale = stale.exclude(pk__in=keep_pks)
+                    self._clear(stale, bulk)
+                else:
+                    old_objs = set(self.using(db).all())
+                    for obj in objs:
+                        # Unsaved objects can't be part of the current
+                        # relation and have no hashable primary key yet.
+                        if not obj._state.adding and obj in old_objs:
+                            old_objs.remove(obj)
+                    # Every object in old_objs was read through this
+                    # manager's core_filters (exact content type and object
+                    # identifier), so each one is related to this target.
+                    if old_objs:
+                        self._clear(
+                            self.using(db).filter(pk__in=[obj.pk for obj in old_objs]),
+                            bulk,
+                        )
+                self._composite_write_add(
+                    write_saved if bulk else (*write_saved, *unsaved_objs),
+                    db,
+                    bulk,
+                )
+            self._assign_to_target(write_saved if bulk else objs)
+
         def set(self, objs, *, bulk=True, clear=False):
             # Force evaluation of `objs` in case it's a queryset whose value
             # could be affected by `manager.clear()`. Refs #19816.
             objs = tuple(objs)
 
             db = router.db_for_write(self.model, instance=self.instance)
+            if self.is_composite_pk:
+                self._remove_prefetched_objects()
+                self._composite_set(objs, db, bulk, clear)
+                return
             with transaction.atomic(using=db, savepoint=False):
                 if clear:
                     self.clear()
@@ -1140,6 +1440,8 @@ def create_generic_related_manager(superclass, rel):
         aset.alters_data = True
 
         def create(self, **kwargs):
+            if self.is_composite_pk:
+                self._check_target()
             self._remove_prefetched_objects()
             kwargs[self.content_type_field_name] = self.content_type
             kwargs[self.object_id_field_name] = self.pk_val
@@ -1154,6 +1456,8 @@ def create_generic_related_manager(superclass, rel):
         acreate.alters_data = True
 
         def get_or_create(self, **kwargs):
+            if self.is_composite_pk:
+                self._check_target()
             kwargs[self.content_type_field_name] = self.content_type
             kwargs[self.object_id_field_name] = self.pk_val
             db = router.db_for_write(self.model, instance=self.instance)
@@ -1167,6 +1471,8 @@ def create_generic_related_manager(superclass, rel):
         aget_or_create.alters_data = True
 
         def update_or_create(self, **kwargs):
+            if self.is_composite_pk:
+                self._check_target()
             kwargs[self.content_type_field_name] = self.content_type
             kwargs[self.object_id_field_name] = self.pk_val
             db = router.db_for_write(self.model, instance=self.instance)
