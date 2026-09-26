@@ -63,6 +63,8 @@ class SQLCompiler:
         self.annotation_col_map = None
         self.klass_info = None
         self._meta_ordering = None
+        # True while rendering a member query of a compound statement.
+        self.is_compound_part = False
 
     def __repr__(self):
         return (
@@ -554,6 +556,32 @@ class SQLCompiler:
                 continue
             seen.add((without_ordering, params_hash))
             result.append((resolved, (sql, params, is_ref)))
+        if (
+            self.query.semijoin_filtered
+            and result
+            and not self.is_compound_part
+            and not self.query.combinator
+            and not self.query.distinct_fields
+            and not self.query.group_by
+        ):
+            # Queries filtered through correlated EXISTS semi-joins don't
+            # duplicate rows, but their order is otherwise only constrained
+            # by the explicit/default ordering. When such ordering exists,
+            # append the full primary key so ties and slices are stable
+            # regardless of join planning or the number of matching source
+            # rows. With no ordering (e.g. an aggregate/count query, whose
+            # ordering is cleared), nothing is added.
+            alias = self.query.get_initial_alias()
+            descending = not self.query.standard_ordering
+            for pk_field in self.query.get_meta().pk_fields:
+                expr = OrderBy(pk_field.get_col(alias), descending=descending)
+                sql, params = self.compile(expr)
+                without_ordering = self.ordering_parts.search(sql)[1]
+                params_hash = make_hashable(params)
+                if (without_ordering, params_hash) in seen:
+                    continue
+                seen.add((without_ordering, params_hash))
+                result.append((expr, (sql, params, False)))
         return result
 
     def get_extra_select(self, order_by, select):
@@ -603,6 +631,10 @@ class SQLCompiler:
             query.get_compiler(self.using, self.connection, self.elide_empty)
             for query in self.query.combined_queries
         ]
+        # Member queries of a compound statement can't emit their own
+        # ordering; suppress the semi-join tie-breaking ordering for them.
+        for compiler in compilers:
+            compiler.is_compound_part = True
         if not features.supports_slicing_ordering_in_compound:
             for compiler in compilers:
                 if compiler.query.is_sliced:

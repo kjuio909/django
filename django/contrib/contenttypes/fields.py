@@ -59,8 +59,12 @@ class JSONQuote(Func):
         )
 
     def as_postgresql(self, compiler, connection, **extra_context):
+        # TO_JSON() returns a value of type json, but the stored reference is a
+        # text column and the surrounding concatenation is textual. Cast to
+        # text so the comparison and string concatenation operate on text.
         return self.as_sql(
-            compiler, connection, function="TO_JSON", **extra_context
+            compiler, connection, template="TO_JSON(%(expressions)s)::text",
+            **extra_context,
         )
 
 
@@ -849,6 +853,42 @@ class GenericRelation(ForeignObject):
                 )
             )
         return WhereNode(conditions, connector=AND)
+
+    def get_semijoin_restriction(self, inner_alias):
+        """
+        Return the WHERE fragment correlating a correlated subquery over the
+        source model with the outer row of this (composite-PK) model.
+
+        ``inner_alias`` is the source-model alias inside the subquery. The
+        fragment matches source rows whose content type is this model's and
+        whose stored JSON array text reference encodes the outer row's
+        primary key components; those components are referenced through
+        OuterRef so the correlation survives alias relabeling.
+        """
+        source_opts = self.remote_field.model._meta
+        content_type_field = source_opts.get_field(self.content_type_field_name)
+        object_id_field = source_opts.get_field(self.object_id_field_name)
+        contenttype_pk = self.get_content_type().pk
+        conditions = [
+            content_type_field.get_lookup("exact")(
+                content_type_field.get_col(inner_alias), contenttype_pk
+            )
+        ]
+        reference = encode_composite_reference(
+            [
+                ResolvedOuterRef(component.name)
+                for component in self.model._meta.pk.fields
+            ]
+        )
+        conditions.append(
+            object_id_field.get_lookup("exact")(
+                object_id_field.get_col(inner_alias), reference
+            )
+        )
+        return WhereNode(conditions, connector=AND)
+
+    def is_semijoin_relation(self):
+        return isinstance(self.model._meta.pk, CompositePrimaryKey)
 
     def bulk_related_objects(self, objs, using=DEFAULT_DB_ALIAS):
         """

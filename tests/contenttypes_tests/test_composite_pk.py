@@ -2,7 +2,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.db import connection
-from django.db.models import Count, Q
+from django.db.models import Count, F, Q
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 
@@ -763,4 +763,178 @@ class SinglePKGenericRelationQueryTestCase(TestCase):
         self.assertEqual(
             list(Question.objects.exclude(answer_set__text="apple")),
             [self.other_question],
+        )
+
+
+class GFKCompositeRelationSemanticsTestCase(TestCase):
+    """
+    Deterministic-set semantics for reverse GenericRelation queries on a
+    composite-PK target, beyond GFKCompositeRelationQueryTestCase:
+    same-row correlation across nested boolean trees, negation boundaries,
+    chained filters, and stable ordering/slicing.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.target_a = GFKCompositeTarget.objects.create(code=1, tenant="1")
+        cls.target_b = GFKCompositeTarget.objects.create(code=1, tenant="2")
+        cls.target_c = GFKCompositeTarget.objects.create(code=2, tenant="1")
+        cls.source_apple = GFKCompositeAttachment.objects.create(
+            text="apple", content_object=cls.target_a
+        )
+        cls.source_apricot = GFKCompositeAttachment.objects.create(
+            text="apricot", content_object=cls.target_a
+        )
+        cls.source_banana = GFKCompositeAttachment.objects.create(
+            text="banana", content_object=cls.target_b
+        )
+
+    def test_same_call_conditions_require_one_row(self):
+        # No single attachment is both the apple row and the apricot row.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__text="apple",
+                    attachments__id=self.source_apricot.pk,
+                )
+            ),
+            [],
+        )
+        # ... but two separate filter() calls may be satisfied by two rows.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(attachments__text="apple")
+                .filter(attachments__id=self.source_apricot.pk)
+            ),
+            [self.target_a],
+        )
+
+    def test_nested_or_and_not(self):
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(
+                Q(attachments__text="banana")
+                | ~Q(attachments__text="apple")
+            ),
+            [self.target_b, self.target_c],
+        )
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(
+                Q(attachments__text="banana")
+                & Q(
+                    Q(attachments__text="banana")
+                    | Q(attachments__text="apricot")
+                )
+            ),
+            [self.target_b],
+        )
+
+    def test_negation_keeps_targets_without_sources(self):
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(~Q(attachments__text="apple")),
+            [self.target_b, self.target_c],
+        )
+        # Double negation is a positive existence check.
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(~Q(attachments__text="apple")),
+            [self.target_a],
+        )
+
+    def test_xor_only_one_branch_matching(self):
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(
+                Q(attachments__text="banana")
+                ^ Q(attachments__text__startswith="apr")
+            ),
+            [self.target_a, self.target_b],
+        )
+
+    def test_f_expression_correlates_with_target_column(self):
+        # No attachment text equals its target's tenant component yet.
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text=F("tenant"))),
+            [],
+        )
+        GFKCompositeAttachment.objects.create(text="1", content_object=self.target_a)
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(attachments__text=F("tenant"))),
+            [self.target_a],
+        )
+
+    def test_ordering_and_slicing_are_stable(self):
+        qs = GFKCompositeTarget.objects.filter(
+            attachments__text__in=[
+                "apple",
+                "apricot",
+                "banana",
+            ]
+        ).order_by("code")
+        # code=1 ties between target_a and target_b; tenant breaks the tie,
+        # and the composite key guarantees a stable order for pagination.
+        first_page = list(qs[:1])
+        second_page = list(qs[1:2])
+        self.assertEqual(first_page, [self.target_a])
+        self.assertEqual(second_page, [self.target_b])
+        self.assertEqual(
+            list(qs),
+            [self.target_a, self.target_b],
+        )
+        # Repeated evaluation doesn't change membership or length.
+        for _ in range(3):
+            self.assertEqual(qs.count(), 2)
+            self.assertCountEqual(list(qs), [self.target_a, self.target_b])
+
+    def test_filter_by_relation_instance_and_in(self):
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments=self.source_banana
+                )
+            ),
+            [self.target_b],
+        )
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(
+                attachments__in=GFKCompositeAttachment.objects.filter(
+                    text__in=["apple", "banana"]
+                )
+            ).distinct(),
+            [self.target_a, self.target_b],
+        )
+
+    def test_source_column_isnull(self):
+        GFKCompositeAttachment.objects.create(
+            text="cherry", content_object=self.target_c
+        )
+        # A column-level isnull is a source-row condition evaluated inside the
+        # correlated subquery, not a relation-existence check.
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.filter(attachments__object_id__isnull=False),
+            [self.target_a, self.target_b, self.target_c],
+        )
+        # A NULL object_id row can never encode a composite reference, so no
+        # target has a related row satisfying object_id IS NULL.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    attachments__object_id__isnull=True
+                )
+            ),
+            [],
+        )
+
+    def test_nested_subquery_correlation(self):
+        subquery = GFKCompositeTarget.objects.filter(
+            attachments__text="apricot"
+        ).values("pk")
+        self.assertEqual(
+            list(GFKCompositeTarget.objects.filter(pk__in=subquery)),
+            [self.target_a],
+        )
+        self.assertCountEqual(
+            GFKCompositeTarget.objects.exclude(
+                pk__in=GFKCompositeTarget.objects.filter(
+                    attachments__text="apricot"
+                ).values("pk")
+            ),
+            [self.target_b, self.target_c],
         )

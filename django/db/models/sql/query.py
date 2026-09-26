@@ -328,6 +328,11 @@ class Query(BaseExpression):
 
         self._filtered_relations = {}
 
+        # True when at least one filter has been rewritten into a correlated
+        # EXISTS semi-join over a composite-PK reverse relation. Used to make
+        # ordering deterministic (see SQLCompiler.get_order_by()).
+        self.semijoin_filtered = False
+
     @property
     def output_field(self):
         if len(self.select) == 1:
@@ -1663,6 +1668,7 @@ class Query(BaseExpression):
         A preprocessor for the internal _add_q(). Responsible for doing final
         join promotion.
         """
+        q_object = self._rewrite_semijoin_relations(q_object)
         # For join promotion this case is doing an AND for the added q_object
         # and existing conditions. So, any existing inner join forces the join
         # type to remain inner. Existing outer joins can however be demoted.
@@ -1686,6 +1692,190 @@ class Query(BaseExpression):
 
     def clear_where(self):
         self.where = WhereNode()
+
+    def _get_semijoin_relation(self, first_name):
+        """
+        Return the reverse-relation field to use for semi-join filtering when
+        ``first_name`` resolves to a GenericRelation whose target carries a
+        composite primary key (matched through a stored JSON array text
+        reference), or None.
+        """
+        try:
+            meta = self.get_meta()
+            field = meta.get_field(first_name)
+        except (FieldDoesNotExist, AttributeError):
+            return None
+        # A reverse relation descriptor (GenericRel) delegates to its field.
+        relation = getattr(field, "field", field)
+        if callable(getattr(relation, "is_semijoin_relation", None)):
+            return relation if relation.is_semijoin_relation() else None
+        return None
+
+    def _rewrite_semijoin_relations(self, q_object):
+        """
+        Rewrite maximal subtrees of ``q_object`` that filter a composite-PK
+        reverse relation into correlated EXISTS predicates.
+
+        Source constraints of a single non-negated subtree all coincide on
+        one source row inside the same subquery (keeping AND/OR structure), so
+        a conjunction can't be satisfied by separate rows and the outer query
+        doesn't yield duplicate target rows. A negation (``~Q`` / exclude)
+        forms a boundary translated into its own NOT EXISTS, so targets
+        without any source row survive negation. Separate filter() calls
+        remain separate predicates (the usual multi-valued relationship
+        semantics).
+        """
+        kind, payload = self._semijoin_lower(q_object)
+        if kind == "row":
+            relation, inner_q = payload
+            return Q(self._wrap_semijoin(relation, inner_q))
+        # "expr": relational leaves have been replaced by correlated EXISTS
+        # predicates; the payload is a Q node or a single bare predicate.
+        return payload if isinstance(payload, Q) else Q(payload)
+
+    def _semijoin_lower(self, node):
+        """
+        Lower a Q node to an intermediate form:
+
+          ("row", (relation, inner_q)): a non-negated, homogeneous subtree of
+              source-row conditions of one relation, usable directly inside a
+              correlated EXISTS.
+          ("expr", q_node): anything else; relational parts that could be
+              collapsed have already been wrapped in EXISTS predicates among
+              ``q_node``'s children.
+        """
+        items = [
+            (
+                self._semijoin_lower(child)
+                if isinstance(child, Q)
+                else self._semijoin_lower_leaf(child)
+            )
+            for child in node.children
+        ]
+
+        rows = [item for item in items if item[0] == "row"]
+        collapsible = (
+            len(rows) == len(items)
+            and len(rows) > 0
+            and node.connector in (AND, OR)
+        )
+        if collapsible:
+            relation = rows[0][1][0]
+            if all(item[1][0] is relation for item in rows):
+                inner_q = Q.create(connector=node.connector)
+                inner_q.children = [item[1][1] for item in rows]
+                if node.negated:
+                    # Negation boundary: exclude targets having a source row
+                    # matching the whole subtree.
+                    return "expr", self._wrap_semijoin(relation, inner_q, negate=True)
+                return "row", (relation, inner_q)
+
+        # Mixed (or XOR) node: keep the boolean structure, collapsing sibling
+        # row conditions of each relation into one EXISTS under AND/OR.
+        outer = Q.create(connector=node.connector)
+        outer.negated = node.negated
+        if node.connector in (AND, OR):
+            groups = {}
+            order = []
+            for kind, payload in items:
+                if kind == "row":
+                    relation, row_q = payload
+                    if relation not in groups:
+                        groups[relation] = []
+                        order.append(("row-group", relation))
+                    groups[relation].append(row_q)
+                else:
+                    order.append(("expr", payload))
+            for entry in order:
+                if entry[0] == "row-group":
+                    relation = entry[1]
+                    inner_q = Q.create(groups[relation], connector=node.connector)
+                    outer.children.append(self._wrap_semijoin(relation, inner_q))
+                else:
+                    outer.children.append(entry[1])
+        else:
+            for kind, payload in items:
+                if kind == "row":
+                    relation, row_q = payload
+                    outer.children.append(self._wrap_semijoin(relation, row_q))
+                else:
+                    outer.children.append(payload)
+        return "expr", outer
+
+    def _semijoin_lower_leaf(self, child):
+        """Classify a single (key, value) Q leaf."""
+        if not isinstance(child, tuple) or len(child) != 2:
+            return "expr", child
+        key, value = child
+        parts = key.split(LOOKUP_SEP)
+        relation = self._get_semijoin_relation(parts[0])
+        if relation is None:
+            return "expr", child
+        rest = parts[1:]
+        if len(rest) == 1 and rest[0] == "isnull":
+            # Existence of the relation itself, not a source column.
+            exists = self._wrap_semijoin(relation, Q())
+            return "expr", ~exists if value else exists
+        if not rest:
+            return "expr", child
+        # A relation-level lookup (rel=instance, rel__in=<queryset>) keeps the
+        # generic join machinery; recognize it by the first remaining name not
+        # resolving to a source-model field.
+        try:
+            relation.remote_field.model._meta.get_field(rest[0])
+        except FieldDoesNotExist:
+            return "expr", child
+        # A normal source-row condition, including column-level __isnull.
+        return "row", (relation, Q(**{LOOKUP_SEP.join(rest): value}))
+
+    def _wrap_semijoin(self, relation, inner_q, negate=False):
+        """Build the correlated EXISTS (or NOT EXISTS) predicate."""
+        inner_q = self._outerize_q(inner_q)
+        inner = self.__class__(relation.remote_field.model)
+        inner_alias = inner.get_initial_alias()
+        correlation = relation.get_semijoin_restriction(inner_alias)
+        if inner_q:
+            inner.add_q(inner_q)
+        inner.where.add(correlation, AND)
+        inner.clear_ordering(force=True)
+        self.semijoin_filtered = True
+        exists = Exists(inner)
+        return ~exists if negate else exists
+
+    @staticmethod
+    def _outerize_value(value):
+        """
+        Turn references to the outer (target) query inside a filter value
+        into OuterRefs, mirroring split_exclude()'s handling of F() values.
+        """
+        if isinstance(value, OuterRef):
+            return value
+        if isinstance(value, F):
+            return OuterRef(value.name)
+        if isinstance(value, (list, tuple)):
+            converted = [Query._outerize_value(item) for item in value]
+            return type(value)(converted)
+        if hasattr(value, "replace_expressions"):
+            return value.replace_expressions(
+                {
+                    expr: OuterRef(expr.name)
+                    for expr in value.flatten()
+                    if isinstance(expr, F) and not isinstance(expr, OuterRef)
+                }
+            )
+        return value
+
+    @classmethod
+    def _outerize_q(cls, q):
+        clone = Q.create(connector=q.connector)
+        clone.negated = q.negated
+        for child in q.children:
+            if isinstance(child, Q):
+                clone.children.append(cls._outerize_q(child))
+            else:
+                key, value = child
+                clone.children.append((key, cls._outerize_value(value)))
+        return clone
 
     def _add_q(
         self,
