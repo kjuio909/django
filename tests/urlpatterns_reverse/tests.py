@@ -801,6 +801,8 @@ class URLPatternReverse(SimpleTestCase):
             _append_query_fragment("/p/?x=1#f", query={"a": 2}, fragment="g"),
             "/p/?x=1&a=2#g",
         )
+        # An existing empty fragment is preserved when only a query is added.
+        self.assertEqual(_append_query_fragment("/p/x#", query={"a": 2}), "/p/x?a=2#")
 
     def test_reverse_pattern_with_existing_query_string(self):
         # A "?" literal in the pattern is structural, not path content.
@@ -844,6 +846,18 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(
             reverse("existing-query-fragment", query={"a": 1}, fragment="g"),
             "/weird2/?x=1&a=1#g",
+        )
+
+    def test_reverse_pattern_with_existing_empty_fragment(self):
+        # A literal "#" with an empty fragment is part of the resolved URL, not
+        # path content, and must survive even when only a query is appended.
+        self.assertEqual(reverse("existing-empty-fragment"), "/weird5/#")
+        self.assertEqual(
+            reverse("existing-empty-fragment", query={"a": 1}), "/weird5/?a=1#"
+        )
+        # A supplied fragment still replaces the empty one.
+        self.assertEqual(
+            reverse("existing-empty-fragment", fragment="other"), "/weird5/#other"
         )
 
     def test_reverse_pattern_separators_not_double_encoded(self):

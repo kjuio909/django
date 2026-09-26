@@ -93,6 +93,10 @@ def _append_query_fragment(url, query=None, fragment=None):
     already present in *url* is joined rather than given a second separator.
     """
     scheme, netloc, path, existing_query, existing_fragment = urlsplit(url)
+    # urlsplit() represents a missing and an empty fragment identically, so
+    # remember whether the resolver returned a literal "#" (an empty existing
+    # fragment) that must be preserved when no replacement is supplied.
+    fragment_present = "#" in url
     if query is not None:
         if isinstance(query, QueryDict):
             # QueryDict.urlencode() keeps every repeated value, in insertion
@@ -120,8 +124,12 @@ def _append_query_fragment(url, query=None, fragment=None):
         fragment_is_empty = not fragment
         existing_fragment = fragment
     url = urlunsplit((scheme, netloc, path, existing_query, existing_fragment))
-    # urlunsplit() drops an empty fragment, but an explicitly supplied empty
-    # fragment must still end the URL with "#".
+    # urlunsplit() drops an empty fragment, but an explicitly empty fragment
+    # -- either supplied by the caller or already present in the resolved URL
+    # when no replacement is given -- must still end the URL with "#".
+    fragment_is_empty = fragment_is_empty or (
+        fragment is None and fragment_present and not existing_fragment
+    )
     if fragment_is_empty and not url.endswith("#"):
         url += "#"
     return url

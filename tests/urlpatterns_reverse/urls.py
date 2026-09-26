@@ -60,6 +60,7 @@ urlpatterns = [
     re_path(r"^weird/\?x=1&y=2$", empty_view, name="existing-query"),
     re_path(r"^weird2/\?x=1#frag$", empty_view, name="existing-query-fragment"),
     re_path(r"^weird3/#frag$", empty_view, name="existing-fragment"),
+    re_path(r"^weird5/#$", empty_view, name="existing-empty-fragment"),
     path("weird4/?x=1", empty_view, name="existing-query-path"),
     re_path(r"^people/(?P<state>\w\w)/(?P<name>\w+)/$", empty_view, name="people3"),
     re_path(r"^people/(?P<state>\w\w)/(?P<name>[0-9])/$", empty_view, name="people4"),
