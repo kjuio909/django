@@ -18,8 +18,15 @@ def get_normalized_value(value, lhs):
     if isinstance(value, Model):
         if not value._is_pk_set():
             raise ValueError("Model instances passed to related filters must be saved.")
+        if isinstance(lhs, ColPairs):
+            # The columns of the resolved ColPairs are the related model's
+            # primary key components (for example when filtering a reverse
+            # generic relation to a composite primary key, where the forward
+            # path info describes the single stored reference column instead).
+            sources = lhs.sources
+        else:
+            sources = composite.unnest(lhs.output_field.path_infos[-1].target_fields)
         value_list = []
-        sources = composite.unnest(lhs.output_field.path_infos[-1].target_fields)
         for source in sources:
             while not isinstance(value, source.model) and source.remote_field:
                 source = source.remote_field.model._meta.get_field(
