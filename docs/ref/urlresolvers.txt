@@ -80,12 +80,16 @@ rendered through their ``repr()``. Empty values keep their ``=``.
 The public iteration order of the supplied container is preserved, and the
 argument is read without being modified. An empty query (``None``, an empty
 mapping or sequence, or an empty ``QueryDict``) does not add a ``?``.
+If the resolved URL already carries a query string or fragment, new query
+data is merged after the existing query (keeping its order and a single
+``?`` separator) and the existing fragment is preserved after it;
+percent-escapes already present are not encoded again.
 
 The ``fragment`` keyword argument specifies a fragment identifier to be
 appended to the returned URL (that is, after the path and query string,
-preceded by a ``#``). It must be a string, which is appended verbatim without
-any percent-encoding; pass ``""`` to end the URL with a bare ``#``, or ``None``
-(the default) to omit the fragment entirely.
+preceded by a ``#``). It must be a string, which is percent-encoded exactly
+once so the result stays a legal URL; pass ``""`` or ``None`` (the default)
+to omit the fragment entirely, in which case no ``#`` is added.
 
 For example:
 

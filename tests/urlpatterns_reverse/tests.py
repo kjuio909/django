@@ -6,6 +6,7 @@ import pickle
 import sys
 import threading
 from collections import OrderedDict
+from urllib.parse import quote
 
 from admin_scripts.tests import AdminScriptTestCase
 
@@ -563,9 +564,10 @@ class URLPatternReverse(SimpleTestCase):
     def test_reverse_with_fragment(self):
         self.assertEqual(reverse("test", fragment="tab-1"), "/test/1#tab-1")
 
-    def test_reverse_with_fragment_not_encoded(self):
+    def test_reverse_with_fragment_encoded(self):
         self.assertEqual(
-            reverse("test", fragment="tab 1 is the best!"), "/test/1#tab 1 is the best!"
+            reverse("test", fragment="tab 1 is the best!"),
+            "/test/1#tab%201%20is%20the%20best%21",
         )
 
     def test_reverse_with_query_and_fragment(self):
@@ -576,7 +578,7 @@ class URLPatternReverse(SimpleTestCase):
 
     def test_reverse_with_empty_fragment(self):
         self.assertEqual(reverse("test", fragment=None), "/test/1")
-        self.assertEqual(reverse("test", fragment=""), "/test/1#")
+        self.assertEqual(reverse("test", fragment=""), "/test/1")
 
     def test_reverse_with_invalid_fragment(self):
         cases = [0, False, {}, [], set(), ()]
@@ -763,12 +765,13 @@ class URLPatternReverse(SimpleTestCase):
         # The fragment always follows the query string.
         self.assertEqual(reverse("test", query={"a": 1}, fragment="f"), "/test/1?a=1#f")
 
-    def test_reverse_fragment_not_encoded_or_mixed_into_path(self):
+    def test_reverse_fragment_encoded_and_not_mixed_into_path(self):
         fragment = "café #/?%s"
-        self.assertEqual(reverse("test", fragment=fragment), f"/test/1#{fragment}")
+        encoded = quote(fragment, safe="")
+        self.assertEqual(reverse("test", fragment=fragment), f"/test/1#{encoded}")
         url = reverse("test", query={"a": "1"}, fragment=fragment)
         self.assertTrue(url.startswith("/test/1?a=1#"))
-        self.assertEqual(url.removeprefix("/test/1?a=1#"), fragment)
+        self.assertEqual(url.removeprefix("/test/1?a=1#"), encoded)
 
     def test_reverse_lazy_fragment(self):
         self.assertEqual(
@@ -780,8 +783,8 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(reverse("test", query=[]), "/test/1")
         self.assertEqual(reverse("test", query=QueryDict()), "/test/1")
         self.assertEqual(reverse("test"), "/test/1")
-        # An explicitly empty fragment keeps the "#".
-        self.assertEqual(reverse("test", fragment=""), "/test/1#")
+        # An explicitly empty fragment adds no "#".
+        self.assertEqual(reverse("test", fragment=""), "/test/1")
         # An empty query with a fragment adds no "?".
         self.assertEqual(reverse("test", query={}, fragment="f"), "/test/1#f")
 
@@ -800,6 +803,26 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(
             _append_query_fragment("/p/?x=1#f", query={"a": 2}, fragment="g"),
             "/p/?x=1&a=2#g",
+        )
+
+    def test_reverse_existing_fragment_kept_for_empty_fragment(self):
+        # An empty fragment adds no "#" and doesn't drop an existing one.
+        self.assertEqual(_append_query_fragment("/p/#frag", fragment=""), "/p/#frag")
+        self.assertEqual(
+            _append_query_fragment("/p/?x=1#frag", query={"a": 2}, fragment=""),
+            "/p/?x=1&a=2#frag",
+        )
+
+    def test_reverse_existing_percent_escapes_not_reencoded(self):
+        # Percent-escapes already present in the base URL are preserved
+        # verbatim while new data is encoded exactly once.
+        self.assertEqual(
+            _append_query_fragment("/p/a%20b/", query={"x": "a b"}, fragment="c d"),
+            "/p/a%20b/?x=a+b#c%20d",
+        )
+        self.assertEqual(
+            _append_query_fragment("/p/?x=a%20b#c%2Fd", query={"y": "1"}),
+            "/p/?x=a%20b&y=1#c%2Fd",
         )
 
     def test_reverse_invalid_query_failure_has_no_side_effect(self):
