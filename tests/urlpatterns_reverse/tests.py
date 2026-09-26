@@ -802,6 +802,57 @@ class URLPatternReverse(SimpleTestCase):
             "/p/?x=1&a=2#g",
         )
 
+    def test_reverse_pattern_with_existing_query_string(self):
+        # A "?" literal in the pattern is structural, not path content.
+        self.assertEqual(reverse("existing-query"), "/weird/?x=1&y=2")
+        self.assertEqual(reverse("existing-query-path"), "/weird4/?x=1")
+        # A new query is merged into the existing one, preserving order, with
+        # a single "?" separator.
+        self.assertEqual(
+            reverse("existing-query", query={"a": 1, "b": 2}),
+            "/weird/?x=1&y=2&a=1&b=2",
+        )
+        self.assertEqual(
+            reverse("existing-query-path", query={"a": 1}),
+            "/weird4/?x=1&a=1",
+        )
+        self.assertEqual(
+            reverse("existing-query", query={"a": 1}, fragment="f"),
+            "/weird/?x=1&y=2&a=1#f",
+        )
+
+    def test_reverse_pattern_with_existing_fragment(self):
+        # A "#" literal in the pattern is structural, not path content.
+        self.assertEqual(reverse("existing-fragment"), "/weird3/#frag")
+        # A new query is inserted before the existing fragment.
+        self.assertEqual(
+            reverse("existing-fragment", query={"a": 1}), "/weird3/?a=1#frag"
+        )
+        # A new fragment replaces the existing one.
+        self.assertEqual(
+            reverse("existing-fragment", fragment="other"), "/weird3/#other"
+        )
+
+    def test_reverse_pattern_with_existing_query_string_and_fragment(self):
+        self.assertEqual(reverse("existing-query-fragment"), "/weird2/?x=1#frag")
+        # The new query joins the existing one, ahead of the fragment, which
+        # is preserved.
+        self.assertEqual(
+            reverse("existing-query-fragment", query={"a": 1}),
+            "/weird2/?x=1&a=1#frag",
+        )
+        self.assertEqual(
+            reverse("existing-query-fragment", query={"a": 1}, fragment="g"),
+            "/weird2/?x=1&a=1#g",
+        )
+
+    def test_reverse_pattern_separators_not_double_encoded(self):
+        # The structural "?" and "#" are not percent-encoded, and an encoded
+        # query value is still encoded exactly once.
+        url = reverse("existing-query-fragment", query={"a": "100%"})
+        self.assertEqual(url, "/weird2/?x=1&a=100%25#frag")
+        self.assertEqual(reverse("existing-query-fragment", query={"a": "100%"}), url)
+
     def test_reverse_invalid_query_failure_has_no_side_effect(self):
         cases = [0, False, [1, 3, 5], {1, 2, 3}, "string"]
         for query in cases:

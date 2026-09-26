@@ -392,7 +392,10 @@ URLs
 
 * :func:`~django.urls.reverse` (and :func:`~django.urls.reverse_lazy`) now
   accept ``query`` and ``fragment`` keyword arguments to append a query string
-  and a fragment identifier to the reversed URL.
+  and a fragment identifier to the reversed URL. Literal ``?`` and ``#``
+  characters in a URL pattern are now kept as structural separators in the
+  reversed URL instead of being percent-encoded, so an existing query string
+  or fragment is merged with the new values.
 
 Utilities
 ~~~~~~~~~

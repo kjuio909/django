@@ -805,9 +805,18 @@ class URLResolver:
                     candidate_pat % text_candidate_subs,
                 ):
                     # safe characters from `pchar` definition of RFC 3986
-                    url = quote(
-                        candidate_pat % text_candidate_subs,
-                        safe=RFC3986_SUBDELIMS + "/~:@",
+                    safe_chars = RFC3986_SUBDELIMS + "/~:@"
+                    # Quote the substituted arguments and the pattern
+                    # skeleton separately. Arguments are fully encoded,
+                    # while "?" and "#" literals from the pattern itself
+                    # remain structural so that a reversed URL can carry a
+                    # query string or a fragment identifier.
+                    quoted_subs = {
+                        k: quote(str(v), safe=safe_chars)
+                        for k, v in text_candidate_subs.items()
+                    }
+                    url = quote(_prefix, safe=safe_chars) + quote(
+                        result % quoted_subs, safe=safe_chars + "?#%"
                     )
                     # Don't allow construction of scheme relative urls.
                     return escape_leading_slashes(url)

@@ -87,6 +87,13 @@ preceded by a ``#``). It must be a string, which is appended verbatim without
 any percent-encoding; pass ``""`` to end the URL with a bare ``#``, or ``None``
 (the default) to omit the fragment entirely.
 
+If the URL pattern itself contains a literal ``?`` or ``#``, those characters
+are kept as structural separators in the returned URL rather than being
+percent-encoded into the path. A ``query`` is then merged into the existing
+query string (preserving the order of the existing keys, with a single ``?``
+separator), and a ``fragment`` replaces the existing fragment, which otherwise
+is preserved. The fragment always follows the entire query string.
+
 For example:
 
 .. code-block:: pycon

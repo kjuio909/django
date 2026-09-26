@@ -55,6 +55,12 @@ urlpatterns = [
     ),
     re_path(r"^hardcoded/$", empty_view, name="hardcoded"),
     re_path(r"^hardcoded/doc\.pdf$", empty_view, name="hardcoded2"),
+    # Patterns whose reversed URL literally contains a query string and/or a
+    # fragment identifier.
+    re_path(r"^weird/\?x=1&y=2$", empty_view, name="existing-query"),
+    re_path(r"^weird2/\?x=1#frag$", empty_view, name="existing-query-fragment"),
+    re_path(r"^weird3/#frag$", empty_view, name="existing-fragment"),
+    path("weird4/?x=1", empty_view, name="existing-query-path"),
     re_path(r"^people/(?P<state>\w\w)/(?P<name>\w+)/$", empty_view, name="people3"),
     re_path(r"^people/(?P<state>\w\w)/(?P<name>[0-9])/$", empty_view, name="people4"),
     re_path(r"^people/((?P<state>\w\w)/test)?/(\w+)/$", empty_view, name="people6"),
