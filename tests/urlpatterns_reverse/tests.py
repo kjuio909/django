@@ -39,6 +39,7 @@ from django.urls import (
 )
 from django.urls.base import _append_query_fragment
 from django.urls.resolvers import RegexPattern
+from django.utils.datastructures import MultiValueDict
 from django.utils.functional import lazy
 
 from . import middleware, urlconf_outer, views
@@ -672,6 +673,42 @@ class URLPatternReverse(SimpleTestCase):
         # A mapping collapses duplicate keys, keeping the last value, without
         # resorting the remaining keys.
         self.assertEqual(reverse("test", query=mapping), "/test/1?z=3&a=2")
+
+    def test_reverse_with_query_multivaluedict(self):
+        # A MultiValueDict is a mapping with repeated keys; every value is
+        # emitted as a repeated key, in stored order.
+        query = MultiValueDict()
+        query.setlist("z", [1, 3])
+        query["a"] = 2
+        self.assertEqual(reverse("test", query=query), "/test/1?z=1&z=3&a=2")
+
+    def test_reverse_with_query_multivaluedict_constructor(self):
+        query = MultiValueDict({"k": [1, 2, 3], "s": ["x"]})
+        self.assertEqual(reverse("test", query=query), "/test/1?k=1&k=2&k=3&s=x")
+
+    def test_reverse_with_query_multivaluedict_nested(self):
+        # Lists stored in a MultiValueDict are expanded recursively, never
+        # rendered through repr().
+        query = MultiValueDict({"k": [[1, 2], [3]]})
+        url = reverse("test", query=query)
+        self.assertNotIn("[", url)
+        self.assertEqual(url, "/test/1?k=1&k=2&k=3")
+
+    def test_reverse_with_query_multivaluedict_empty(self):
+        self.assertEqual(reverse("test", query=MultiValueDict()), "/test/1")
+
+    def test_reverse_with_query_multivaluedict_not_mutated(self):
+        query = MultiValueDict()
+        query.setlist("z", [1, 3])
+        query["a"] = 2
+        snapshot = list(query.lists())
+        reverse("test", query=query)
+        self.assertEqual(list(query.lists()), snapshot)
+
+    def test_reverse_with_query_multivaluedict_stable(self):
+        # Byte-identical output across calls.
+        query = MultiValueDict({"z": [1], "a": [2, 3]})
+        self.assertEqual(reverse("test", query=query), reverse("test", query=query))
 
     def test_reverse_with_query_lazy_string(self):
         lazy_string = lazy(str, str)("hello")

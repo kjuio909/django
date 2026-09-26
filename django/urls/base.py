@@ -45,12 +45,25 @@ def _query_pairs(query):
 
     The iteration order of the supplied container is preserved. Objects
     exposing an ``items()`` method are treated as mappings (mirroring
-    urllib.parse.urlencode()), other sequences are walked in their own order.
-    The container validation mirrors urlencode() so the same TypeErrors are
+    urllib.parse.urlencode()); mappings that also expose ``lists()`` (such as
+    MultiValueDict) keep every value for a repeated key, in their stored
+    order, whereas plain mappings collapse repeated keys to their single
+    exposed value. Other sequences are walked in their own order. The
+    container validation mirrors urlencode() so the same TypeErrors are
     raised for invalid input; the argument is only read, never modified.
     """
     if hasattr(query, "items"):
-        items = query.items()
+        if hasattr(query, "lists"):
+            # MultiValueDict-like mappings expose only the last value through
+            # items(), so lists() is needed to keep repeated values. QueryDict
+            # is handled separately by the caller with its own urlencode().
+            items = (
+                (key, leaf)
+                for key, values in query.lists()
+                for leaf in _query_leaves(values)
+            )
+        else:
+            items = query.items()
     else:
         try:
             # Mirrors urlencode(): only sequences whose first element is a

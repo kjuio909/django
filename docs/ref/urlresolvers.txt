@@ -69,11 +69,14 @@ use for reversing. By default, the root URLconf for the current thread is used.
 
 The ``query`` keyword argument specifies parameters to be added to the returned
 URL. It can accept an instance of :class:`~django.http.QueryDict` (such as
-``request.GET``) or any value compatible with :func:`urllib.parse.urlencode`.
+``request.GET``), a :class:`~django.utils.datastructures.MultiValueDict`, or
+any value compatible with :func:`urllib.parse.urlencode`.
 The encoded query string is appended to the resolved URL, prefixed by a ``?``.
-When a key maps to an iterable of values (including nested iterables), every
-value is expanded into a repeated key in the order of the input, and containers
-are never rendered through their ``repr()``. Empty values keep their ``=``.
+When a key maps to an iterable of values (including nested iterables), or a
+mapping stores several values for a repeated key (as with
+:class:`~django.utils.datastructures.MultiValueDict`), every value is expanded
+into a repeated key in the order of the input, and containers are never
+rendered through their ``repr()``. Empty values keep their ``=``.
 The public iteration order of the supplied container is preserved, and the
 argument is read without being modified. An empty query (``None``, an empty
 mapping or sequence, or an empty ``QueryDict``) does not add a ``?``.

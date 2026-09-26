@@ -387,6 +387,13 @@ Tests
   Previously, they would consume the streaming response's content, causing
   subsequent calls to fail.
 
+URLs
+~~~~
+
+* :func:`~django.urls.reverse` (and :func:`~django.urls.reverse_lazy`) now
+  accept ``query`` and ``fragment`` keyword arguments to append a query string
+  and a fragment identifier to the reversed URL.
+
 Utilities
 ~~~~~~~~~
 
