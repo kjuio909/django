@@ -915,8 +915,19 @@ def create_generic_related_manager(superclass, rel):
             self.object_id_field_name = rel.field.object_id_field_name
             self.prefetch_cache_name = rel.field.attname
             self.pk_val = instance.pk
-            if isinstance(instance._meta.pk, CompositePrimaryKey):
-                # The reference is stored as a JSON array text.
+            self.is_composite_pk = isinstance(
+                instance._meta.pk, CompositePrimaryKey
+            )
+            if self.is_composite_pk:
+                # The reference is stored as JSON array text. An unsaved
+                # target can't be referenced yet, so fail early instead of
+                # storing a dangling reference that looks like any other row.
+                if instance._state.adding:
+                    raise ValueError(
+                        "%r instance needs to be saved before its generic "
+                        "relationship can be used." % instance
+                    )
+                self.target_pk_field = instance._meta.pk
                 self.pk_val = GenericForeignKey.encode_composite_pk(
                     instance._meta.pk, instance.pk
                 )
@@ -1030,30 +1041,103 @@ def create_generic_related_manager(superclass, rel):
                 False,
             )
 
+        def _check_source(self, obj, *, must_be_saved):
+            if not isinstance(obj, self.model):
+                raise TypeError(
+                    "'%s' instance expected, got %r"
+                    % (self.model._meta.object_name, obj)
+                )
+            if must_be_saved:
+                db = router.db_for_write(self.model, instance=self.instance)
+                if obj._state.adding or obj._state.db != db:
+                    raise ValueError(
+                        "%r instance isn't saved. Use bulk=False or save "
+                        "the object first." % obj
+                    )
+            if self.is_composite_pk:
+                self._check_composite_reference(obj)
+
+        def _check_composite_reference(self, obj):
+            # A source may be loose (no content type / reference yet), already
+            # point at this target, or carry a well-formed reference to another
+            # target of the same content type (a legitimate move). It must not
+            # carry another content type, nor a reference that isn't a valid
+            # JSON array for this composite key -- otherwise the batch would
+            # silently overwrite an unrelated row or an unusable reference.
+            ct_attname = self.model._meta.get_field(
+                self.content_type_field_name
+            ).attname
+            source_ct = getattr(obj, ct_attname, None)
+            if source_ct is not None and source_ct != self.content_type.id:
+                raise ValueError(
+                    "%r references a different content type; it cannot be "
+                    "assigned to this generic relationship." % obj
+                )
+            source_ref = getattr(obj, self.object_id_field_name, None)
+            if source_ct == self.content_type.id and source_ref is not None:
+                try:
+                    decoded = GenericForeignKey.decode_composite_pk(
+                        self.target_pk_field, source_ref
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "%r has an invalid composite object reference %r."
+                        % (obj, source_ref)
+                    ) from exc
+                # A composite primary key never has nullable components
+                # (models.E042), so a JSON null element can only be a
+                # dangling reference and must be rejected.
+                if any(value is None for value in decoded):
+                    raise ValueError(
+                        "%r has an invalid composite object reference %r: "
+                        "primary key components cannot be null."
+                        % (obj, source_ref)
+                    )
+
+        def _check_target_exists(self, db):
+            # Assigning to a relationship bound to a vanished target would
+            # store references to an object that no longer exists. Only
+            # assignment operations (add/set) need this; remove() and clear()
+            # are safely scoped no-ops once a target has been deleted.
+            if not self.is_composite_pk:
+                return
+            model = self.instance.__class__
+            target_exists = (
+                model._default_manager.using(db)
+                .filter(pk=self.instance.pk)
+                .exists()
+            )
+            if not target_exists:
+                raise model.DoesNotExist(
+                    "%r no longer exists in the database." % self.instance
+                )
+
+        def _validate_sources(self, objs, *, bulk):
+            for obj in objs:
+                self._check_source(obj, must_be_saved=bulk)
+
+        def _assign_source(self, obj):
+            setattr(obj, self.content_type_field_name, self.content_type)
+            setattr(obj, self.object_id_field_name, self.pk_val)
+
         def add(self, *objs, bulk=True):
             self._remove_prefetched_objects()
             db = router.db_for_write(self.model, instance=self.instance)
 
-            def check_and_update_obj(obj):
-                if not isinstance(obj, self.model):
-                    raise TypeError(
-                        "'%s' instance expected, got %r"
-                        % (self.model._meta.object_name, obj)
-                    )
-                setattr(obj, self.content_type_field_name, self.content_type)
-                setattr(obj, self.object_id_field_name, self.pk_val)
+            # Validate every argument before touching anything, so a failure
+            # never leaves a partial assignment: objects that were already
+            # related stay related, and the other arguments keep pointing at
+            # whatever they pointed at before the call. With a composite
+            # primary key this also guarantees that sources belonging to
+            # another content type (or carrying an invalid reference) can't be
+            # half-rewritten.
+            self._check_target_exists(db)
+            self._validate_sources(objs, bulk=bulk)
+            for obj in objs:
+                self._assign_source(obj)
 
             if bulk:
-                pks = []
-                for obj in objs:
-                    if obj._state.adding or obj._state.db != db:
-                        raise ValueError(
-                            "%r instance isn't saved. Use bulk=False or save "
-                            "the object first." % obj
-                        )
-                    check_and_update_obj(obj)
-                    pks.append(obj.pk)
-
+                pks = [obj.pk for obj in objs]
                 self.model._base_manager.using(db).filter(pk__in=pks).update(
                     **{
                         self.content_type_field_name: self.content_type,
@@ -1063,7 +1147,6 @@ def create_generic_related_manager(superclass, rel):
             else:
                 with transaction.atomic(using=db, savepoint=False):
                     for obj in objs:
-                        check_and_update_obj(obj)
                         obj.save()
 
         add.alters_data = True
@@ -1076,7 +1159,14 @@ def create_generic_related_manager(superclass, rel):
         def remove(self, *objs, bulk=True):
             if not objs:
                 return
-            self._clear(self.filter(pk__in=[o.pk for o in objs]), bulk)
+            self._remove_prefetched_objects()
+            # The queryset is scoped to this manager's content type and object
+            # reference, so a source that points at another target, another
+            # content type, carries an invalid reference, has no primary key,
+            # or no longer exists simply matches nothing and causes no error.
+            # (Generic relations delete the removed source rows rather than
+            # nulling their foreign key.)
+            self._clear(self.filter(pk__in=[obj.pk for obj in objs]), bulk)
 
         remove.alters_data = True
 
@@ -1116,19 +1206,29 @@ def create_generic_related_manager(superclass, rel):
             objs = tuple(objs)
 
             db = router.db_for_write(self.model, instance=self.instance)
-            with transaction.atomic(using=db, savepoint=False):
-                if clear:
+            self._check_target_exists(db)
+            if clear:
+                # Validate before opening the transaction (and therefore
+                # before clearing), so an unusable argument can't wipe the
+                # relation or doom the surrounding transaction.
+                self._validate_sources(objs, bulk=bulk)
+                with transaction.atomic(using=db, savepoint=False):
                     self.clear()
                     self.add(*objs, bulk=bulk)
-                else:
-                    old_objs = set(self.using(db).all())
-                    new_objs = []
-                    for obj in objs:
-                        if obj in old_objs:
-                            old_objs.remove(obj)
-                        else:
-                            new_objs.append(obj)
+            else:
+                old_objs = set(self.using(db).all())
+                new_objs = []
+                for obj in objs:
+                    if obj in old_objs:
+                        old_objs.remove(obj)
+                    else:
+                        new_objs.append(obj)
 
+                # Validate every source to be added before the transaction
+                # removes anything, so a failure leaves the relation -- and
+                # the surrounding transaction -- untouched.
+                self._validate_sources(new_objs, bulk=bulk)
+                with transaction.atomic(using=db, savepoint=False):
                     self.remove(*old_objs)
                     self.add(*new_objs, bulk=bulk)
 

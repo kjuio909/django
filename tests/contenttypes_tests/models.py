@@ -126,7 +126,9 @@ class GFKCompositeTarget(models.Model):
     pk = models.CompositePrimaryKey("code", "tenant")
     code = models.SmallIntegerField()
     tenant = models.CharField(max_length=50)
-    attachments = GenericRelation("GFKCompositeAttachment")
+    attachments = GenericRelation(
+        "GFKCompositeAttachment", related_query_name="composite_target"
+    )
 
 
 class GFKCompositeDateTarget(models.Model):
