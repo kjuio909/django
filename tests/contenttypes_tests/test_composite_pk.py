@@ -737,6 +737,362 @@ class GFKCompositeRelationQueryTestCase(TestCase):
         )
 
 
+class GFKCompositeReportTestCase(TestCase):
+    """
+    Report queries over the reverse generic relation of a model whose
+    primary key is composite: each target appears exactly once, projected
+    with its full primary key, a business attribute, and the number of
+    sources matching a tag condition.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        # Two targets sharing exactly one primary key component (code=1),
+        # plus a third one no source ever points to.
+        cls.target_a = GFKCompositeTarget.objects.create(
+            code=1, tenant="1", label="alpha"
+        )
+        cls.target_b = GFKCompositeTarget.objects.create(
+            code=1, tenant="2", label="beta"
+        )
+        cls.target_c = GFKCompositeTarget.objects.create(
+            code=2, tenant="1", label="gamma"
+        )
+        # Sources are written crosswise, with distinguishable tags.
+        cls.source_a_red_1 = GFKCompositeAttachment.objects.create(
+            text="a-red-1", tag="red", content_object=cls.target_a
+        )
+        cls.source_a_red_2 = GFKCompositeAttachment.objects.create(
+            text="a-red-2", tag="red", content_object=cls.target_a
+        )
+        cls.source_a_blue = GFKCompositeAttachment.objects.create(
+            text="a-blue", tag="blue", content_object=cls.target_a
+        )
+        cls.source_b_red = GFKCompositeAttachment.objects.create(
+            text="b-red", tag="red", content_object=cls.target_b
+        )
+        cls.source_b_blue = GFKCompositeAttachment.objects.create(
+            text="b-blue", tag="blue", content_object=cls.target_b
+        )
+
+    def _report(self, tag="red"):
+        return (
+            GFKCompositeTarget.objects.annotate(
+                source_count=Count("attachments", filter=Q(attachments__tag=tag))
+            )
+            .values("code", "tenant", "label", "source_count")
+            .order_by("-source_count", "code", "tenant")
+        )
+
+    def _snapshot_database(self):
+        sources = list(
+            GFKCompositeAttachment.objects.order_by("pk").values(
+                "pk", "text", "tag", "content_type_id", "object_id"
+            )
+        )
+        targets = list(
+            GFKCompositeTarget.objects.order_by("pk").values("code", "tenant", "label")
+        )
+        return sources, targets
+
+    def test_report_projects_each_target_once_with_full_pk(self):
+        # Sorted by descending count, then by the full composite primary key.
+        self.assertEqual(
+            list(self._report()),
+            [
+                {"code": 1, "tenant": "1", "label": "alpha", "source_count": 2},
+                {"code": 1, "tenant": "2", "label": "beta", "source_count": 1},
+                {"code": 2, "tenant": "1", "label": "gamma", "source_count": 0},
+            ],
+        )
+
+    def test_report_counts_only_sources_matching_the_tag(self):
+        self.assertEqual(
+            list(self._report(tag="blue")),
+            [
+                {"code": 1, "tenant": "1", "label": "alpha", "source_count": 1},
+                {"code": 1, "tenant": "2", "label": "beta", "source_count": 1},
+                {"code": 2, "tenant": "1", "label": "gamma", "source_count": 0},
+            ],
+        )
+        # A tag nothing has leaves every count at zero; ordering falls back
+        # to the composite primary key alone.
+        self.assertEqual(
+            list(self._report(tag="missing")),
+            [
+                {"code": 1, "tenant": "1", "label": "alpha", "source_count": 0},
+                {"code": 1, "tenant": "2", "label": "beta", "source_count": 0},
+                {"code": 2, "tenant": "1", "label": "gamma", "source_count": 0},
+            ],
+        )
+
+    def test_zero_count_targets_can_be_kept_or_excluded(self):
+        report = self._report()
+        self.assertEqual(
+            list(report.filter(source_count=0)),
+            [{"code": 2, "tenant": "1", "label": "gamma", "source_count": 0}],
+        )
+        self.assertEqual(
+            list(report.exclude(source_count=0)),
+            [
+                {"code": 1, "tenant": "1", "label": "alpha", "source_count": 2},
+                {"code": 1, "tenant": "2", "label": "beta", "source_count": 1},
+            ],
+        )
+        self.assertEqual(
+            list(report.filter(source_count__gte=1)),
+            [
+                {"code": 1, "tenant": "1", "label": "alpha", "source_count": 2},
+                {"code": 1, "tenant": "2", "label": "beta", "source_count": 1},
+            ],
+        )
+
+    def test_report_is_stable_across_reevaluation_filtering_and_slicing(self):
+        report = self._report()
+        expected = list(report)
+        # Re-evaluating the same queryset and a fresh clone agree.
+        self.assertEqual(list(report), expected)
+        self.assertEqual(list(report.all()), expected)
+        self.assertEqual(report.count(), len(expected))
+        # Slicing doesn't shift the boundaries.
+        self.assertEqual(list(report[:2]), expected[:2])
+        self.assertEqual(list(report[1:]), expected[1:])
+        self.assertEqual(list(report[1:2]), expected[1:2])
+        # Further filtering composes with the report conditions.
+        self.assertEqual(list(report.filter(tenant="1")), [expected[0], expected[2]])
+        self.assertEqual(list(report.exclude(label="beta")), [expected[0], expected[2]])
+
+    def test_target_and_source_conditions_both_apply(self):
+        # The shared code=1 component must not leak target_b into a
+        # tenant="1" filter, and the source condition must not be relaxed
+        # either.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    tenant="1", attachments__tag="red"
+                ).distinct()
+            ),
+            [self.target_a],
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    tenant="2", attachments__tag="red"
+                ).distinct()
+            ),
+            [self.target_b],
+        )
+        # Both source conditions apply to the same source row: target_b has
+        # a red source, but not one named a-red-1.
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    tenant="2",
+                    attachments__tag="red",
+                    attachments__text="a-red-1",
+                )
+            ),
+            [],
+        )
+        # A target with several matching sources still appears once.
+        self.assertEqual(
+            GFKCompositeTarget.objects.filter(attachments__tag="red")
+            .distinct()
+            .count(),
+            2,
+        )
+
+    def test_condition_order_does_not_change_results(self):
+        expected = [self.target_a]
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(tenant="1")
+                .filter(attachments__tag="red")
+                .distinct()
+            ),
+            expected,
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(attachments__tag="red")
+                .filter(tenant="1")
+                .distinct()
+            ),
+            expected,
+        )
+        self.assertEqual(
+            list(
+                GFKCompositeTarget.objects.filter(
+                    Q(tenant="1") & Q(attachments__tag="red")
+                ).distinct()
+            ),
+            expected,
+        )
+
+    def test_prefetch_direct_and_report_counts_agree(self):
+        report = {
+            (row["code"], row["tenant"]): row["source_count"]
+            for row in self._report(tag="red")
+        }
+        targets = {
+            target.pk: target
+            for target in GFKCompositeTarget.objects.prefetch_related("attachments")
+        }
+        self.assertEqual(
+            set(targets), {(1, "1"), (1, "2"), (2, "1")},
+        )
+        for pk, target in targets.items():
+            with self.subTest(pk=pk):
+                # The prefetch gives each target only its own sources.
+                prefetched = list(target.attachments.all())
+                self.assertEqual(
+                    sum(1 for source in prefetched if source.tag == "red"),
+                    report[pk],
+                )
+                # Direct access agrees with the prefetch cache.
+                self.assertEqual(
+                    target.attachments.filter(tag="red").count(), report[pk]
+                )
+        # And the forward read of each source agrees with the report.
+        self.assertEqual(
+            {
+                source.text: source.content_object.pk
+                for source in GFKCompositeAttachment.objects.prefetch_related(
+                    "content_object"
+                )
+            },
+            {
+                "a-red-1": (1, "1"),
+                "a-red-2": (1, "1"),
+                "a-blue": (1, "1"),
+                "b-red": (1, "2"),
+                "b-blue": (1, "2"),
+            },
+        )
+
+    def test_invalid_references_do_not_affect_the_report(self):
+        content_type = ContentType.objects.get_for_model(GFKCompositeTarget)
+        other_content_type = ContentType.objects.get_for_model(GFKCompositeDateTarget)
+        cases = [
+            (content_type, None),  # empty reference
+            (None, '[1, "1"]'),  # missing content type
+            (other_content_type, '[1, "1"]'),  # content type of another model
+            (content_type, "{not json"),  # not JSON
+            (content_type, "[1]"),  # too few components
+            (content_type, '[1, "1", 3]'),  # too many components
+            (content_type, '["oops", "1"]'),  # component conversion failure
+            (content_type, '[7, "missing"]'),  # no such target
+        ]
+        broken_sources = []
+        for index, (ct, reference) in enumerate(cases):
+            source = GFKCompositeAttachment.objects.create(
+                text="broken-%s" % index, tag="red"
+            )
+            GFKCompositeAttachment.objects.filter(pk=source.pk).update(
+                content_type=ct, object_id=reference
+            )
+            broken_sources.append(source)
+        expected_report = list(self._report())
+        before = self._snapshot_database()
+        # The broken rows are simply never matched: the report, its
+        # ordering, its count, and slicing are all unaffected.
+        self.assertEqual(list(self._report()), expected_report)
+        self.assertEqual(list(self._report()[:2]), expected_report[:2])
+        self.assertEqual(self._report().count(), len(expected_report))
+        self.assertEqual(
+            list(self._report(tag="red").filter(source_count__gte=1)),
+            [row for row in expected_report if row["source_count"] >= 1],
+        )
+        # Prefetching the broken sources yields None, not an exception.
+        prefetched = {
+            source.text: source.content_object
+            for source in GFKCompositeAttachment.objects.filter(
+                pk__in=[source.pk for source in broken_sources]
+            ).prefetch_related("content_object")
+        }
+        self.assertEqual(
+            prefetched, {"broken-%s" % index: None for index in range(len(cases))}
+        )
+        # Nothing was written and the broken rows were left untouched.
+        self.assertEqual(self._snapshot_database(), before)
+
+    def test_special_value_components_still_locate_the_unique_target(self):
+        special_tenants = [
+            "",
+            "None",
+            "literal@at",
+            "a/b",
+            "a,b",
+            "café ★ → 日本語",
+        ]
+        for index, tenant in enumerate(special_tenants, start=100):
+            target = GFKCompositeTarget.objects.create(
+                code=index, tenant=tenant, label="special"
+            )
+            # A sibling sharing the code component must never be matched.
+            GFKCompositeTarget.objects.create(
+                code=index, tenant="other-%s" % index, label="sibling"
+            )
+            GFKCompositeAttachment.objects.create(
+                text="s-%s" % index, tag="red", content_object=target
+            )
+        report = (
+            GFKCompositeTarget.objects.filter(label="special")
+            .annotate(
+                source_count=Count("attachments", filter=Q(attachments__tag="red"))
+            )
+            .values("code", "tenant", "source_count")
+        )
+        self.assertEqual(
+            {(row["code"], row["tenant"]): row["source_count"] for row in report},
+            {
+                (index, tenant): 1
+                for index, tenant in zip(
+                    range(100, 100 + len(special_tenants)), special_tenants
+                )
+            },
+        )
+        siblings = GFKCompositeTarget.objects.filter(label="sibling").annotate(
+            source_count=Count("attachments", filter=Q(attachments__tag="red"))
+        )
+        self.assertEqual(
+            {target.pk: target.source_count for target in siblings},
+            {
+                (index, "other-%s" % index): 0
+                for index in range(100, 100 + len(special_tenants))
+            },
+        )
+
+    def test_delete_source_only_reduces_its_own_target(self):
+        before = list(self._report())
+        self.source_a_red_1.delete()
+        after = list(self._report())
+        # Only target_a's count dropped; the other rows are unchanged.
+        self.assertEqual(after[0]["source_count"], before[0]["source_count"] - 1)
+        self.assertEqual(after[1:], before[1:])
+        # Deleting a source with another tag doesn't change this report.
+        self.source_a_blue.delete()
+        self.assertEqual(list(self._report()), after)
+
+    def test_delete_target_cascades_only_to_its_sources(self):
+        self.target_a.delete()
+        self.assertFalse(
+            GFKCompositeAttachment.objects.filter(text__startswith="a-").exists()
+        )
+        self.assertEqual(
+            list(self._report()),
+            [
+                {"code": 1, "tenant": "2", "label": "beta", "source_count": 1},
+                {"code": 2, "tenant": "1", "label": "gamma", "source_count": 0},
+            ],
+        )
+        # The other targets and their sources are untouched.
+        self.assertEqual(
+            list(self.target_b.attachments.order_by("text")),
+            [self.source_b_blue, self.source_b_red],
+        )
+
+
 class SinglePKGenericRelationQueryTestCase(TestCase):
     """Single-field primary key generic relation queries are unchanged."""
 
@@ -763,4 +1119,40 @@ class SinglePKGenericRelationQueryTestCase(TestCase):
         self.assertEqual(
             list(Question.objects.exclude(answer_set__text="apple")),
             [self.other_question],
+        )
+
+    def test_report_projection_order_count_and_slice(self):
+        qs = (
+            Question.objects.annotate(
+                source_count=Count(
+                    "answer_set", filter=Q(answer_set__text__startswith="a")
+                )
+            )
+            .values("id", "text", "source_count")
+            .order_by("-source_count", "id")
+        )
+        expected = [
+            {"id": self.question.id, "text": "q", "source_count": 2},
+            {"id": self.other_question.id, "text": "other", "source_count": 0},
+        ]
+        self.assertEqual(list(qs), expected)
+        # Re-evaluation, filtering, and slicing keep the same boundaries.
+        self.assertEqual(list(qs.all()), expected)
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual(list(qs[:1]), expected[:1])
+        self.assertEqual(list(qs.exclude(source_count=0)), expected[:1])
+
+    def test_delete_source_and_target(self):
+        self.answer_a.delete()
+        self.assertEqual(
+            Question.objects.annotate(n=Count("answer_set"))
+            .get(pk=self.question.pk)
+            .n,
+            1,
+        )
+        self.question.delete()
+        # The cascade removes only this question's answers.
+        self.assertFalse(Answer.objects.filter(pk=self.answer_b.pk).exists())
+        self.assertTrue(
+            Question.objects.filter(pk=self.other_question.pk).exists()
         )

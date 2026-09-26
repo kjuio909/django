@@ -126,6 +126,7 @@ class GFKCompositeTarget(models.Model):
     pk = models.CompositePrimaryKey("code", "tenant")
     code = models.SmallIntegerField()
     tenant = models.CharField(max_length=50)
+    label = models.CharField(max_length=100, default="", blank=True)
     attachments = GenericRelation("GFKCompositeAttachment")
 
 
@@ -137,6 +138,7 @@ class GFKCompositeDateTarget(models.Model):
 
 class GFKCompositeAttachment(models.Model):
     text = models.CharField(max_length=100, default="", blank=True)
+    tag = models.CharField(max_length=50, default="", blank=True)
     content_type = models.ForeignKey(ContentType, models.CASCADE, null=True)
     object_id = models.TextField(null=True)
     content_object = GenericForeignKey()
