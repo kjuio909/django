@@ -70,7 +70,10 @@ use for reversing. By default, the root URLconf for the current thread is used.
 The ``query`` keyword argument specifies parameters to be added to the returned
 URL. It can accept an instance of :class:`~django.http.QueryDict` (such as
 ``request.GET``), a :class:`~django.utils.datastructures.MultiValueDict`, or
-any value compatible with :func:`urllib.parse.urlencode`.
+any value compatible with :func:`urllib.parse.urlencode`. One-shot iterables
+of ``(key, value)`` pairs, such as generators, are also accepted; they are
+consumed only once the route and arguments have been resolved, so a failed
+lookup leaves them untouched and the call can be retried.
 The encoded query string is appended to the resolved URL, prefixed by a ``?``.
 When a key maps to an iterable of values (including nested iterables), or a
 mapping stores several values for a repeated key (as with

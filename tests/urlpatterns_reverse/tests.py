@@ -656,6 +656,101 @@ class URLPatternReverse(SimpleTestCase):
 
         self.assertEqual(reverse("test", query={"k": values()}), "/test/1?k=1&k=2")
 
+    def test_reverse_with_query_one_shot_iterable(self):
+        # One-shot iterables of (key, value) pairs are accepted and consumed
+        # exactly once, in input order.
+        def pairs():
+            yield ("hello", "world")
+            yield ("foo", 123)
+            yield ("foo", 456)
+
+        self.assertEqual(
+            reverse("test", query=pairs()), "/test/1?hello=world&foo=123&foo=456"
+        )
+        self.assertEqual(reverse("test", query=iter([("a", 1)])), "/test/1?a=1")
+        self.assertEqual(
+            reverse("test", query={"a": 1, "b": 2}.items()), "/test/1?a=1&b=2"
+        )
+
+    def test_reverse_with_query_one_shot_empty(self):
+        # An empty one-shot iterable adds no "?".
+        self.assertEqual(reverse("test", query=iter(())), "/test/1")
+
+    def test_reverse_with_query_one_shot_invalid(self):
+        cases = [iter([1, 2, 3]), iter("ab"), iter([b"x"])]
+        for query in cases:
+            with self.subTest(query=query):
+                with self.assertRaises(TypeError):
+                    reverse("test", query=query)
+        # A failed call leaves no state behind; a legal call immediately
+        # afterwards is unaffected.
+        self.assertEqual(reverse("test", query={"a": 1}), "/test/1?a=1")
+
+    def test_reverse_one_shot_query_not_consumed_on_no_reverse_match(self):
+        # The route and arguments are resolved before the query is
+        # serialized, so a failed lookup consumes nothing from a one-shot
+        # input and the call can be retried with it.
+        def pairs():
+            yield ("a", 1)
+            yield ("b", 2)
+
+        query = pairs()
+        with self.assertRaises(NoReverseMatch):
+            reverse("nonexistent-view", query=query)
+        with self.assertRaises(NoReverseMatch):
+            reverse("places", args=(1, 2), query=query)
+        self.assertEqual(reverse("test", query=query), "/test/1?a=1&b=2")
+
+    def test_reverse_one_shot_query_not_consumed_on_invalid_fragment(self):
+        # The fragment type is validated before the query is serialized, so
+        # a rejected fragment consumes nothing from a one-shot query input.
+        def pairs():
+            yield ("a", 1)
+
+        query = pairs()
+        with self.assertRaises(TypeError):
+            reverse("test", query=query, fragment=123)
+        self.assertEqual(reverse("test", query=query), "/test/1?a=1")
+
+    def test_reverse_one_shot_query_with_temporary_urlconf(self):
+        # A one-shot query survives namespaces, current_app hints, path
+        # parameters and trailing-slash patterns of a temporary URLconf, and
+        # an equivalent repeated call is byte-identical.
+        urlconf = "urlpatterns_reverse.namespace_urls"
+
+        def pairs():
+            yield ("a", 1)
+            yield ("a", 2)
+
+        url = reverse(
+            "test-ns1:urlobject-view",
+            urlconf=urlconf,
+            kwargs={"arg1": 1, "arg2": 2},
+            query=pairs(),
+            fragment="frag",
+        )
+        self.assertEqual(url, "/test1/inner/1/2/?a=1&a=2#frag")
+        self.assertEqual(
+            reverse(
+                "testapp:urlobject-view",
+                urlconf=urlconf,
+                kwargs={"arg1": 1, "arg2": 2},
+                current_app="test-ns1",
+                query=pairs(),
+                fragment="frag",
+            ),
+            url,
+        )
+        # A failed call against the same URLconf consumes nothing and
+        # doesn't disturb the next resolution.
+        query = pairs()
+        with self.assertRaises(NoReverseMatch):
+            reverse("test-ns1:no-such-view", urlconf=urlconf, query=query)
+        self.assertEqual(
+            reverse("test-ns1:urlobject-view", urlconf=urlconf, query=query),
+            "/test1/inner/?a=1&a=2",
+        )
+
     def test_reverse_with_query_set_value_order(self):
         # A set's values are expanded; their order matches set iteration.
         values = {1, 2}
