@@ -180,6 +180,7 @@ def reverse(
 
     if not isinstance(viewname, str):
         view = viewname
+        ns_default_kwargs = {}
     else:
         *path, view = viewname.split(":")
 
@@ -192,6 +193,9 @@ def reverse(
         resolved_path = []
         ns_pattern = ""
         ns_converters = {}
+        # Extra kwargs contributed by each include() along the namespace
+        # chain. Deeper includes take precedence, matching resolve().
+        ns_default_kwargs = {}
         for ns in path:
             current_ns = current_path.pop() if current_path else None
             # Lookup the name to see if it could be an app identifier.
@@ -213,10 +217,11 @@ def reverse(
                 current_path = None
 
             try:
-                extra, resolver = resolver.namespace_dict[ns]
+                extra, resolver, default_kwargs = resolver.namespace_dict[ns]
                 resolved_path.append(ns)
                 ns_pattern += extra
                 ns_converters.update(resolver.pattern.converters)
+                ns_default_kwargs = {**ns_default_kwargs, **default_kwargs}
             except KeyError as key:
                 if resolved_path:
                     raise NoReverseMatch(
@@ -230,7 +235,13 @@ def reverse(
                 ns_pattern, resolver, tuple(ns_converters.items())
             )
 
-    resolved_url = resolver._reverse_with_prefix(view, prefix, *args, **kwargs)
+    resolved_url = resolver._reverse_with_prefix(
+        view,
+        prefix,
+        *args,
+        _ns_default_kwargs=ns_default_kwargs or None,
+        **kwargs,
+    )
     if query is not None or fragment is not None:
         resolved_url = _append_query_fragment(resolved_url, query, fragment)
     return resolved_url

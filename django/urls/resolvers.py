@@ -586,7 +586,15 @@ class URLResolver:
                         apps.setdefault(url_pattern.app_name, []).append(
                             url_pattern.namespace
                         )
-                        namespaces[url_pattern.namespace] = (p_pattern, url_pattern)
+                        namespaces[url_pattern.namespace] = (
+                            p_pattern,
+                            url_pattern,
+                            # Keep the include()'s own extra kwargs so a
+                            # reverse of a nested name can fill a parameter
+                            # captured on this include's route from its
+                            # default.
+                            url_pattern.default_kwargs,
+                        )
                     else:
                         for name in url_pattern.reverse_dict:
                             for (
@@ -601,7 +609,10 @@ class URLResolver:
                                     (
                                         new_matches,
                                         p_pattern + pat,
-                                        {**defaults, **url_pattern.default_kwargs},
+                                        {
+                                            **url_pattern.default_kwargs,
+                                            **defaults,
+                                        },
                                         {
                                             **self.pattern.converters,
                                             **url_pattern.pattern.converters,
@@ -612,10 +623,22 @@ class URLResolver:
                         for namespace, (
                             prefix,
                             sub_pattern,
+                            sub_defaults,
                         ) in url_pattern.namespace_dict.items():
                             current_converters = url_pattern.pattern.converters
                             sub_pattern.pattern.converters.update(current_converters)
-                            namespaces[namespace] = (p_pattern + prefix, sub_pattern)
+                            # Accumulate the extra kwargs of every include()
+                            # flattened away here; the nearer the include, the
+                            # higher the precedence, mirroring the order in
+                            # which resolve() merges them.
+                            namespaces[namespace] = (
+                                p_pattern + prefix,
+                                sub_pattern,
+                                {
+                                    **url_pattern.default_kwargs,
+                                    **sub_defaults,
+                                },
+                            )
                         for app_name, namespace_list in url_pattern.app_dict.items():
                             apps.setdefault(app_name, []).extend(namespace_list)
                     self._callback_strs.update(url_pattern._callback_strs)
@@ -752,7 +775,9 @@ class URLResolver:
     def reverse(self, lookup_view, *args, **kwargs):
         return self._reverse_with_prefix(lookup_view, "", *args, **kwargs)
 
-    def _reverse_with_prefix(self, lookup_view, _prefix, *args, **kwargs):
+    def _reverse_with_prefix(
+        self, lookup_view, _prefix, *args, _ns_default_kwargs=None, **kwargs
+    ):
         if args and kwargs:
             raise ValueError("Don't mix *args and **kwargs in call to reverse()!")
 
@@ -762,6 +787,12 @@ class URLResolver:
         possibilities = self.reverse_dict.getlist(lookup_view)
 
         for possibility, pattern, defaults, converters in possibilities:
+            # Defaults contributed by include()s above a namespaced resolver
+            # fill parameters captured on those ancestor routes. They have
+            # lower precedence than the endpoint's own defaults, mirroring
+            # the order resolve() merges them in.
+            if _ns_default_kwargs:
+                defaults = {**_ns_default_kwargs, **defaults}
             for result, params in possibility:
                 if args:
                     if len(args) != len(params):

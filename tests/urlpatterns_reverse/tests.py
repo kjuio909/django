@@ -1026,6 +1026,106 @@ class URLPatternReverse(SimpleTestCase):
             reverse("nested-converter-defaults", kwargs={"inner": 9}), url
         )
 
+    def test_reverse_namespaced_include_default(self):
+        # A default on an app-namespaced include() fills a converter
+        # parameter captured by that include's route, so the nested name can
+        # be reversed without supplying it; the generated path resolves back
+        # to the same namespaced view.
+        urlconf = "urlpatterns_reverse.ns_defaults_root"
+        url = reverse(
+            "ns-defaults-mid:ns-defaults-inner:leaf",
+            urlconf=urlconf,
+            kwargs={"pk": 9},
+        )
+        self.assertEqual(url, "/def/5/mid/6/leaf/9/")
+        match = resolve(url, urlconf=urlconf)
+        self.assertEqual(
+            match.view_name, "ns-defaults-mid:ns-defaults-inner:leaf"
+        )
+        self.assertEqual(match.kwargs, {"outer": 5, "mid": 6, "pk": 9})
+        self.assertIsInstance(match.kwargs["pk"], int)
+        # Explicit values are still rendered canonically.
+        self.assertEqual(
+            reverse(
+                "ns-defaults-mid:ns-defaults-inner:leaf",
+                urlconf=urlconf,
+                kwargs={"outer": 15, "mid": 16, "pk": 9},
+            ),
+            "/def/15/mid/16/leaf/9/",
+        )
+        # Repeated reversals with defaults are byte-identical.
+        self.assertEqual(
+            reverse(
+                "ns-defaults-mid:ns-defaults-inner:leaf",
+                urlconf=urlconf,
+                kwargs={"pk": 9},
+            ),
+            url,
+        )
+
+    def test_reverse_namespaced_include_default_with_flattened_include(self):
+        # Defaults on a non-app include that is flattened away while the
+        # reverse dictionaries are populated must still reach a name nested
+        # behind an app-namespaced include further down.
+        urlconf = "urlpatterns_reverse.ns_defaults_root"
+        url = reverse(
+            "ns-defaults-inner:leaf",
+            urlconf=urlconf,
+            kwargs={"pk": 9},
+        )
+        self.assertEqual(url, "/flat/4/b/6/leaf/9/")
+        match = resolve(url, urlconf=urlconf)
+        self.assertEqual(match.view_name, "ns-defaults-inner:leaf")
+        self.assertEqual(
+            match.kwargs, {"a": 4, "extra": ["x", "y"], "b": 6, "pk": 9}
+        )
+
+    def test_reverse_namespaced_include_default_non_pattern_mismatch(self):
+        # A default for a parameter not captured on the route still gates the
+        # reversal: a supplied value different from the default cannot
+        # reverse, supplying nothing uses the default, and a failed call does
+        # not affect a following successful one.
+        urlconf = "urlpatterns_reverse.ns_defaults_root"
+        with self.assertRaises(NoReverseMatch):
+            reverse(
+                "ns-defaults-mid:ns-defaults-inner:themed",
+                urlconf=urlconf,
+                kwargs={"pk": 9, "theme": "dark"},
+            )
+        url = reverse(
+            "ns-defaults-mid:ns-defaults-inner:themed",
+            urlconf=urlconf,
+            kwargs={"pk": 9},
+        )
+        self.assertEqual(url, "/def/5/mid/6/themed/9/")
+        match = resolve(url, urlconf=urlconf)
+        self.assertEqual(
+            match.kwargs,
+            {"outer": 5, "mid": 6, "theme": "light", "pk": 9},
+        )
+
+    def test_reverse_namespaced_include_default_isolation(self):
+        # After a failed lookup against the namespaced conf (missing or
+        # rejected parameter), a legal lookup still builds the same URL and
+        # resolves identically.
+        urlconf = "urlpatterns_reverse.ns_defaults_root"
+        for bad_kwargs in ({}, {"pk": "x"}):
+            with self.assertRaises(NoReverseMatch):
+                reverse(
+                    "ns-defaults-mid:ns-defaults-inner:leaf",
+                    urlconf=urlconf,
+                    kwargs=bad_kwargs,
+                )
+        url = reverse(
+            "ns-defaults-mid:ns-defaults-inner:leaf",
+            urlconf=urlconf,
+            kwargs={"pk": 9},
+        )
+        self.assertEqual(url, "/def/5/mid/6/leaf/9/")
+        match = resolve(url, urlconf=urlconf)
+        self.assertEqual(match.view_name, "ns-defaults-mid:ns-defaults-inner:leaf")
+        self.assertEqual(match.kwargs, {"outer": 5, "mid": 6, "pk": 9})
+
     def test_reverse_invalid_query_failure_has_no_side_effect(self):
         cases = [0, False, [1, 3, 5], {1, 2, 3}, "string"]
         for query in cases:
