@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from itertools import chain
 from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 
 from asgiref.local import Local
@@ -48,7 +49,9 @@ def _query_pairs(query):
     urllib.parse.urlencode()); mappings that also expose ``lists()`` (such as
     MultiValueDict) keep every value for a repeated key, in their stored
     order, whereas plain mappings collapse repeated keys to their single
-    exposed value. Other sequences are walked in their own order. The
+    exposed value. Other sequences are walked in their own order, including
+    one-shot iterables such as generators, whose pairs are serialized only
+    once the caller has confirmed the route and arguments resolve. The
     container validation mirrors urlencode() so the same TypeErrors are
     raised for invalid input; the argument is only read, never modified.
     """
@@ -66,16 +69,37 @@ def _query_pairs(query):
             items = query.items()
     else:
         try:
-            # Mirrors urlencode(): only sequences whose first element is a
-            # (key, value) tuple are accepted; bare scalars, strings and
-            # non-indexable containers fail here.
-            if len(query) and not isinstance(query[0], tuple):
-                raise TypeError
+            iterator = iter(query)
         except TypeError as err:
             raise TypeError(
                 "not a valid non-string sequence or mapping object"
             ) from err
-        items = query
+        try:
+            length = len(query)
+        except TypeError:
+            # A one-shot iterable (e.g. a generator) has no length. Peek at
+            # its first pair for the same validation urlencode() applies to
+            # sequences, without losing it.
+            sentinel = object()
+            first = next(iterator, sentinel)
+            if first is sentinel:
+                items = ()
+            elif not isinstance(first, tuple):
+                raise TypeError("not a valid non-string sequence or mapping object")
+            else:
+                items = chain((first,), iterator)
+        else:
+            try:
+                # Mirrors urlencode(): only sequences whose first element is
+                # a (key, value) tuple are accepted; bare scalars, strings
+                # and non-indexable containers fail here.
+                if length and not isinstance(query[0], tuple):
+                    raise TypeError
+            except TypeError as err:
+                raise TypeError(
+                    "not a valid non-string sequence or mapping object"
+                ) from err
+            items = query
     for pair in items:
         key, value = pair
         for leaf in _query_leaves(value):
@@ -93,27 +117,16 @@ def _append_query_fragment(url, query=None, fragment=None):
     "#" nor clears a fragment already present in *url*. A non-empty fragment
     is percent-encoded exactly once -- existing percent-escapes are kept --
     and replaces any fragment already present, while a query or fragment
-    already in *url* is joined rather than given a second separator.
+    already in *url* is joined rather than given a second separator. The
+    fragment is validated before the query is serialized so that a rejected
+    call never consumes a one-shot query iterable, keeping an immediate
+    retry complete and stable.
     """
     scheme, netloc, path, existing_query, existing_fragment = urlsplit(url)
     # urlsplit() represents a missing and an empty fragment identically, so
     # remember whether the resolver returned a literal "#" (an empty existing
     # fragment) that must be preserved when no replacement is supplied.
     fragment_present = "#" in url
-    if query is not None:
-        if isinstance(query, QueryDict):
-            # QueryDict.urlencode() keeps every repeated value, in insertion
-            # order, and honours the QueryDict's own encoding.
-            query_string = query.urlencode()
-        else:
-            # Values are already expanded into scalars, so doseq=False keeps
-            # lazy string proxies intact (doseq=True would iterate them
-            # character by character). An empty container yields "".
-            query_string = urlencode(list(_query_pairs(query)), doseq=False)
-        if query_string:
-            existing_query = (
-                f"{existing_query}&{query_string}" if existing_query else query_string
-            )
     if fragment is not None:
         # A plain str is accepted, as are lazy string proxies, which behave
         # exactly like str once evaluated. Everything else raises TypeError,
@@ -131,6 +144,20 @@ def _append_query_fragment(url, query=None, fragment=None):
             existing_fragment = quote(fragment, safe="!$&'()*+,;=:@/?%")
         # An explicitly empty fragment is a no-op: it must not create a "#"
         # where there is none, nor clear an existing fragment.
+    if query is not None:
+        if isinstance(query, QueryDict):
+            # QueryDict.urlencode() keeps every repeated value, in insertion
+            # order, and honours the QueryDict's own encoding.
+            query_string = query.urlencode()
+        else:
+            # Values are already expanded into scalars, so doseq=False keeps
+            # lazy string proxies intact (doseq=True would iterate them
+            # character by character). An empty container yields "".
+            query_string = urlencode(list(_query_pairs(query)), doseq=False)
+        if query_string:
+            existing_query = (
+                f"{existing_query}&{query_string}" if existing_query else query_string
+            )
     url = urlunsplit((scheme, netloc, path, existing_query, existing_fragment))
     # urlunsplit() drops an empty fragment, but an empty fragment already
     # present in the resolved URL -- and not replaced by a non-empty one --

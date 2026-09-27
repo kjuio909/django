@@ -656,6 +656,56 @@ class URLPatternReverse(SimpleTestCase):
 
         self.assertEqual(reverse("test", query={"k": values()}), "/test/1?k=1&k=2")
 
+    def test_reverse_with_query_one_shot_pairs(self):
+        # A one-shot iterable of (key, value) pairs is serialized in order,
+        # with multivalue expansion applied to its values.
+        def pairs():
+            yield "a", 1
+            yield "b", [2, 3]
+
+        self.assertEqual(reverse("test", query=pairs()), "/test/1?a=1&b=2&b=3")
+        self.assertEqual(
+            reverse("test", query=iter([("a", 1), ("a", 2)])), "/test/1?a=1&a=2"
+        )
+        # An empty one-shot iterable adds no "?".
+        self.assertEqual(reverse("test", query=iter(())), "/test/1")
+
+    def test_reverse_with_query_one_shot_invalid_pairs(self):
+        def pairs():
+            yield "a", 1
+            yield 2
+
+        with self.assertRaises(TypeError):
+            reverse("test", query=pairs())
+        # A valid call afterwards is unaffected.
+        self.assertEqual(reverse("test", query={"a": 1}), "/test/1?a=1")
+
+    def test_reverse_with_query_one_shot_not_consumed_by_bad_route(self):
+        # A failed resolution must not consume a one-shot query: retrying
+        # with a resolvable route produces the complete URL.
+        def pairs():
+            yield "a", 1
+            yield "b", 2
+
+        query = pairs()
+        with self.assertRaises(NoReverseMatch):
+            reverse("does-not-exist", query=query)
+        self.assertEqual(reverse("test", query=query), "/test/1?a=1&b=2")
+
+    def test_reverse_with_query_one_shot_not_consumed_by_bad_fragment(self):
+        # A fragment type error is raised before the query is serialized, so
+        # the one-shot query survives for an immediate retry.
+        def pairs():
+            yield "a", 1
+            yield "b", 2
+
+        query = pairs()
+        with self.assertRaises(TypeError):
+            reverse("test", query=query, fragment=0)
+        self.assertEqual(
+            reverse("test", query=query, fragment="f"), "/test/1?a=1&b=2#f"
+        )
+
     def test_reverse_with_query_set_value_order(self):
         # A set's values are expanded; their order matches set iteration.
         values = {1, 2}
