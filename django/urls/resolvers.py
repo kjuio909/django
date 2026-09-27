@@ -10,9 +10,10 @@ import functools
 import inspect
 import re
 import string
+from contextlib import nullcontext
 from importlib import import_module
 from pickle import PicklingError
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from asgiref.local import Local
 
@@ -24,7 +25,7 @@ from django.utils.datastructures import MultiValueDict
 from django.utils.functional import cached_property
 from django.utils.http import RFC3986_SUBDELIMS, escape_leading_slashes
 from django.utils.regex_helper import _lazy_re_compile, normalize
-from django.utils.translation import get_language
+from django.utils.translation import get_language, get_language_from_path, override
 
 from .converters import get_converters
 from .exceptions import NoReverseMatch, Resolver404
@@ -246,6 +247,25 @@ _PATH_PARAMETER_COMPONENT_RE = _lazy_re_compile(
 whitespace_set = frozenset(string.whitespace)
 
 
+def _unquote_path_value(value):
+    """
+    Decode the percent-encoded text captured by a route converter.
+
+    Decoding happens exactly once: matching runs on the raw path and each
+    level is consumed by its own pattern before the remainder is passed on,
+    so a value is never decoded twice and an encoded slash (%2F) stays part
+    of the capture. Syntactically loose escapes (a '%' not followed by two
+    hex digits) are left as literal characters -- mirroring the WSGI layer,
+    which only decodes well-formed %XX sequences -- while bytes that are not
+    valid UTF-8 raise ValueError so the pattern rejects the request instead
+    of matching corrupted text.
+    """
+    try:
+        return unquote(value, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Malformed percent-encoded sequence in {value!r}.") from e
+
+
 @functools.lru_cache
 def _route_to_regex(route, is_endpoint):
     """
@@ -331,7 +351,17 @@ class RoutePattern(CheckURLMixin):
                 for key, value in kwargs.items():
                     converter = self.converters[key]
                     try:
-                        kwargs[key] = converter.to_python(value)
+                        # Percent-decode each captured value exactly once
+                        # before handing it to the converter. Matching runs on
+                        # the raw path, so an encoded slash (%2F) stays part
+                        # of the value and never opens a new path level; a
+                        # malformed escape rejects the pattern. ValueError is
+                        # the converter's "does not match" signal (and
+                        # _unquote_path_value wraps bad UTF-8 in ValueError),
+                        # so the pattern simply does not match.
+                        kwargs[key] = converter.to_python(
+                            _unquote_path_value(value)
+                        )
                     except ValueError:
                         return None
                 return path[match.end() :], (), kwargs
@@ -403,10 +433,35 @@ class LocalePrefixPattern:
         else:
             return "%s/" % language_code
 
+    def language_from_path(self, path):
+        """
+        Return the supported language code at the start of *path*, or None.
+
+        The root resolver has already consumed the leading slash by the time
+        *path* reaches this pattern, so it is re-added for the shared prefix
+        detector.
+        """
+        return get_language_from_path("/" + path.removeprefix("/"))
+
     def match(self, path):
-        language_prefix = self.language_prefix
-        if path.startswith(language_prefix):
-            return path.removeprefix(language_prefix), (), {}
+        # An explicit, supported language prefix is always honoured, no
+        # matter which language is currently active, so resolving one path
+        # never depends on the language left behind by a previous resolve().
+        normalized = "/" + path.removeprefix("/")
+        language_code = get_language_from_path(normalized)
+        if language_code is not None:
+            # Strip the prefix as written in the path (it may be a generic
+            # variant such as "en-gb" that resolves to a supported "en"),
+            # while the returned language code selects the route language.
+            raw_language = normalized[1:].split("/", 1)[0]
+            prefix = raw_language + ("" if normalized == "/" + raw_language else "/")
+            return path.removeprefix(prefix), (), {}
+        # Without a language prefix the remainder is resolved under the
+        # active/default language only when the default language must not be
+        # prefixed. Otherwise a prefix is mandatory and bare paths fall
+        # through (the LocaleMiddleware redirects them).
+        if not self.prefix_default_language:
+            return path, (), {}
         return None
 
     def check(self):
@@ -696,46 +751,69 @@ class URLResolver:
         match = self.pattern.match(path)
         if match:
             new_path, args, kwargs = match
-            for pattern in self.url_patterns:
-                try:
-                    sub_match = pattern.resolve(new_path)
-                except Resolver404 as e:
-                    self._extend_tried(tried, pattern, e.args[0].get("tried"))
-                else:
-                    if sub_match:
-                        # Merge captured arguments in match with submatch
-                        sub_match_dict = {**kwargs, **self.default_kwargs}
-                        # Update the sub_match_dict with the kwargs from the
-                        # sub_match.
-                        sub_match_dict.update(sub_match.kwargs)
-                        # If there are *any* named groups, ignore all non-named
-                        # groups. Otherwise, pass all non-named arguments as
-                        # positional arguments.
-                        sub_match_args = sub_match.args
-                        if not sub_match_dict:
-                            sub_match_args = args + sub_match.args
-                        current_route = (
-                            ""
-                            if isinstance(pattern, URLPattern)
-                            else str(pattern.pattern)
-                        )
-                        self._extend_tried(tried, pattern, sub_match.tried)
-                        return ResolverMatch(
-                            sub_match.func,
-                            sub_match_args,
-                            sub_match_dict,
-                            sub_match.url_name,
-                            [self.app_name, *sub_match.app_names],
-                            [self.namespace, *sub_match.namespaces],
-                            self._join_route(current_route, sub_match.route),
-                            tried,
-                            captured_kwargs=sub_match.captured_kwargs,
-                            extra_kwargs={
-                                **self.default_kwargs,
-                                **sub_match.extra_kwargs,
-                            },
-                        )
-                    tried.append([pattern])
+            # An explicit language prefix is authoritative only for the
+            # duration of this resolution: lazy route patterns below an
+            # i18n_patterns() include are compiled in that language. When the
+            # default language is unprefixed, a bare path belongs to that
+            # default language. The previously active language is restored
+            # afterwards so repeated or interleaved resolve() calls never
+            # influence each other.
+            if isinstance(self.pattern, LocalePrefixPattern):
+                language_code = self.pattern.language_from_path(path)
+                if language_code is None and not self.pattern.prefix_default_language:
+                    language_code = settings.LANGUAGE_CODE
+                language_context = (
+                    override(language_code) if language_code else nullcontext()
+                )
+            else:
+                language_context = nullcontext()
+            with language_context:
+                for pattern in self.url_patterns:
+                    try:
+                        sub_match = pattern.resolve(new_path)
+                    except Resolver404 as e:
+                        self._extend_tried(tried, pattern, e.args[0].get("tried"))
+                    else:
+                        if sub_match:
+                            # Merge order, lowest to highest precedence:
+                            # this include's default kwargs, the values
+                            # captured on this include's own route, then the
+                            # sub-match (which already merged its own
+                            # defaults). A value captured from the path is
+                            # therefore restored as written even when a
+                            # default of the same name exists.
+                            sub_match_dict = {**self.default_kwargs, **kwargs}
+                            # Update the sub_match_dict with the kwargs from
+                            # the sub_match.
+                            sub_match_dict.update(sub_match.kwargs)
+                            # If there are *any* named groups, ignore all
+                            # non-named groups. Otherwise, pass all non-named
+                            # arguments as positional arguments.
+                            sub_match_args = sub_match.args
+                            if not sub_match_dict:
+                                sub_match_args = args + sub_match.args
+                            current_route = (
+                                ""
+                                if isinstance(pattern, URLPattern)
+                                else str(pattern.pattern)
+                            )
+                            self._extend_tried(tried, pattern, sub_match.tried)
+                            return ResolverMatch(
+                                sub_match.func,
+                                sub_match_args,
+                                sub_match_dict,
+                                sub_match.url_name,
+                                [self.app_name, *sub_match.app_names],
+                                [self.namespace, *sub_match.namespaces],
+                                self._join_route(current_route, sub_match.route),
+                                tried,
+                                captured_kwargs=sub_match.captured_kwargs,
+                                extra_kwargs={
+                                    **self.default_kwargs,
+                                    **sub_match.extra_kwargs,
+                                },
+                            )
+                        tried.append([pattern])
             raise Resolver404({"tried": tried, "path": new_path})
         raise Resolver404({"path": path})
 

@@ -1311,6 +1311,302 @@ class ResolverTests(SimpleTestCase):
         self.assertNotEqual(resolver._reverse_dict, {})
 
 
+@override_settings(
+    ROOT_URLCONF="urlpatterns_reverse.resolved_paths_urls",
+    LANGUAGE_CODE="en",
+    LANGUAGES=[("en", "English"), ("fr", "French")],
+    USE_I18N=True,
+)
+class ResolveForwardMatchTests(SimpleTestCase):
+    """
+    Forward matching (resolve()) on modular URLconfs: nested includes,
+    application namespaces, language prefixes, trailing slashes and path
+    converters, fed concrete percent-encoded paths.
+    """
+
+    urlconf = "urlpatterns_reverse.resolved_paths_urls"
+
+    def assertNoMatch(self, path):
+        with self.assertRaises(Resolver404) as ctx:
+            resolve(path, self.urlconf)
+        # The failure carries only the conventional Resolver404 payload.
+        self.assertIn("path", ctx.exception.args[0])
+        return ctx.exception.args[0]
+
+    def test_two_includes_namespaces_and_kwargs(self):
+        match = resolve("/en/org/acme/sec/news/num/42/", self.urlconf)
+        # Full view name and the outer-to-inner namespace/app chains.
+        self.assertEqual(
+            match.view_name, "resolved-paths-mid:resolved-paths-inner:num"
+        )
+        self.assertEqual(match.url_name, "num")
+        self.assertEqual(
+            match.namespaces, ["resolved-paths-mid", "resolved-paths-inner"]
+        )
+        self.assertEqual(match.namespace, "resolved-paths-mid:resolved-paths-inner")
+        self.assertEqual(
+            match.app_names, ["resolved-paths-mid", "resolved-paths-inner"]
+        )
+        self.assertEqual(match.app_name, "resolved-paths-mid:resolved-paths-inner")
+        # Business parameters from every level are restored with types.
+        self.assertEqual(
+            match.kwargs, {"org": "acme", "section": "news", "pk": 42}
+        )
+        self.assertIsInstance(match.kwargs["pk"], int)
+        # Include prefixes are never captured parameters. Only the endpoint
+        # capture survives in captured_kwargs.
+        self.assertEqual(match.captured_kwargs, {"pk": 42})
+        # The nested language/include prefixes appear once in the route.
+        self.assertEqual(
+            match.route,
+            "en/org/<slug:org>/sec/<slug:section>/num/<int:pk>/",
+        )
+
+    def test_include_prefixes_are_not_parameters(self):
+        match = resolve("/en/org/acme/index/", self.urlconf)
+        self.assertEqual(match.view_name, "resolved-paths-mid:index")
+        self.assertEqual(match.kwargs, {"org": "acme"})
+        self.assertEqual(match.captured_kwargs, {})
+        self.assertEqual(match.args, ())
+
+    def test_captured_values_override_same_named_include_defaults(self):
+        # Explicitly supplied path values are never replaced by include
+        # defaults of the same name.
+        match = resolve("/en/org/acme/sec/news/themed/9/", self.urlconf)
+        self.assertEqual(
+            match.view_name, "resolved-paths-mid:resolved-paths-inner:themed"
+        )
+        self.assertEqual(
+            match.kwargs,
+            {"org": "acme", "section": "news", "pk": 9, "theme": "light"},
+        )
+        self.assertIsInstance(match.kwargs["pk"], int)
+
+    def test_defaults_fill_parameters_absent_from_the_path(self):
+        # The path the reverse builds when include defaults are used
+        # resolves back with those defaults restored.
+        match = resolve(
+            "/en/org/default-org/sec/default-section/themed/9/", self.urlconf
+        )
+        self.assertEqual(
+            match.kwargs,
+            {
+                "org": "default-org",
+                "section": "default-section",
+                "pk": 9,
+                "theme": "light",
+            },
+        )
+
+    def test_int_converter_rejects_empty_and_non_digits(self):
+        self.assertEqual(resolve("/en/org/o/sec/s/num/7/", self.urlconf).kwargs["pk"], 7)
+        self.assertNoMatch("/en/org/o/sec/s/num/abc/")
+        self.assertNoMatch("/en/org/o/sec/s/num//")
+        self.assertNoMatch("/en/org/o/sec/s/num/12-3/")
+
+    def test_bounded_converter_out_of_range_does_not_hit_sibling(self):
+        # In range: bounded converter matches.
+        match = resolve("/en/org/o/sec/s/small/12/", self.urlconf)
+        self.assertEqual(match.view_name, "resolved-paths-mid:resolved-paths-inner:small")
+        self.assertEqual(match.kwargs["value"], 12)
+        # Out of range: the converter rejects and the sibling route (which
+        # requires an "/overflow/" suffix) must not catch the bare value.
+        self.assertNoMatch("/en/org/o/sec/s/small/1234/")
+        # The sibling is still reachable via its own concrete path.
+        match = resolve("/en/org/o/sec/s/small/1234/overflow/", self.urlconf)
+        self.assertEqual(
+            match.view_name,
+            "resolved-paths-mid:resolved-paths-inner:small-overflow",
+        )
+        self.assertEqual(match.kwargs["value"], 1234)
+
+    def test_slug_converter_rejects_space_empty_and_illegal_chars(self):
+        match = resolve("/en/org/o/sec/s/tag/a-b_1/", self.urlconf)
+        self.assertEqual(match.kwargs["tag"], "a-b_1")
+        # A raw or percent-encoded space is not slug content.
+        self.assertNoMatch("/en/org/o/sec/s/tag/a%20b/")
+        self.assertNoMatch("/en/org/o/sec/s/tag//")
+        self.assertNoMatch("/en/org/o/sec/s/tag/a.b/")
+
+    def test_path_converter_keeps_encoded_slashes_as_content(self):
+        match = resolve("/en/org/o/sec/s/file/a%2Fb/c/", self.urlconf)
+        self.assertEqual(match.kwargs["rest"], "a/b/c")
+        # An encoded slash is not a new path level: the one-segment word
+        # route matches a%2Fb, while the genuinely two-level path matches
+        # the separate two-segment route.
+        match = resolve("/en/org/o/sec/s/word/a%2Fb/", self.urlconf)
+        self.assertEqual(
+            match.view_name, "resolved-paths-mid:resolved-paths-inner:word"
+        )
+        self.assertEqual(match.kwargs["word"], "a/b")
+        match = resolve("/en/org/o/sec/s/word/a/2/", self.urlconf)
+        self.assertEqual(
+            match.view_name, "resolved-paths-mid:resolved-paths-inner:word-two"
+        )
+        self.assertEqual(
+            match.kwargs,
+            {"org": "o", "section": "s", "word": "a", "ordinal": 2},
+        )
+
+    def test_percent_decoding_happens_exactly_once(self):
+        # %25 decodes to a literal '%'; the following '2F' stays text.
+        match = resolve("/en/org/o/sec/s/word/a%252Fb/", self.urlconf)
+        self.assertEqual(match.kwargs["word"], "a%2Fb")
+        # Percent-encoded Unicode, spaces and reserved characters.
+        match = resolve(
+            "/en/org/o/sec/s/word/caf%C3%A9%20x%3F%23/", self.urlconf
+        )
+        self.assertEqual(match.kwargs["word"], "café x?#")
+
+    def test_custom_converter_restores_declared_type(self):
+        # The custom bounded converter hands back an int, not the raw digit
+        # string.
+        match = resolve("/en/org/o/sec/s/small/12/", self.urlconf)
+        self.assertIsInstance(match.kwargs["value"], int)
+        self.assertEqual(match.kwargs["value"], 12)
+
+    def test_converter_internal_exception_is_a_resolution_failure(self):
+        # The converter raises KeyError (not ValueError) for this input; the
+        # internal exception must not escape, only Resolver404 surfaces.
+        self.assertNoMatch("/en/org/o/sec/s/guarded/explode/")
+        match = resolve("/en/org/o/sec/s/guarded/hello/", self.urlconf)
+        self.assertEqual(match.kwargs["value"], "HELLO")
+
+    def test_malformed_percent_sequences_reject_the_path(self):
+        for bad in [
+            "/en/org/o/sec/s/num/12%/",
+            "/en/org/o/sec/s/num/12%a/",
+            "/en/org/o/sec/s/num/12%zz/",
+            "/en/org/o/sec/s/word/%ff/",
+        ]:
+            with self.subTest(bad=bad):
+                self.assertNoMatch(bad)
+
+    def test_query_fragment_are_not_ignorable_tails(self):
+        self.assertNoMatch("/en/org/o/sec/s/num/12/?x=1")
+        self.assertNoMatch("/en/org/o/sec/s/num/12/#frag")
+
+    def test_trailing_and_double_slashes_are_strict(self):
+        base = "/en/org/o/sec/s/num/12"
+        self.assertNoMatch(base)  # missing trailing slash
+        self.assertNoMatch(base + "//")  # repeated trailing slash
+        self.assertNoMatch("/en//org/o/sec/s/num/12/")  # double slash early
+
+    def test_default_and_public_language_prefixes_hit_one_view(self):
+        expected = {
+            "view_name": "resolved-paths-mid:resolved-paths-inner:num",
+            "kwargs": {"org": "o", "section": "s", "pk": 3},
+        }
+        for prefix in ("/en", "/fr"):
+            match = resolve(f"{prefix}/org/o/sec/s/num/3/", self.urlconf)
+            self.assertEqual(match.view_name, expected["view_name"])
+            self.assertEqual(match.kwargs, expected["kwargs"])
+        # With the default language prefixed, a bare path must not resolve.
+        self.assertNoMatch("/org/o/sec/s/num/3/")
+        # An unsupported language prefix is not a language at all.
+        self.assertNoMatch("/de/org/o/sec/s/num/3/")
+
+    def test_resolution_does_not_depend_on_active_language(self):
+        from django.utils import translation
+
+        def resolve_one():
+            return resolve("/fr/org/o/sec/s/num/4/", self.urlconf)
+
+        with translation.override("fr"):
+            fr_active = resolve_one()
+            self.assertEqual(translation.get_language(), "fr")
+        with translation.override("en"):
+            en_active = resolve_one()
+            self.assertEqual(translation.get_language(), "en")
+        # Same path, same answer regardless of the active language.
+        self.assertEqual(en_active.kwargs, fr_active.kwargs)
+        self.assertEqual(en_active.view_name, fr_active.view_name)
+        # The active language is restored after the call.
+        self.assertEqual(translation.get_language(), "en")
+
+    def test_repeated_and_alternated_resolutions_are_stable(self):
+        good_fr = "/fr/org/o/sec/s/num/5/"
+        good_en = "/en/org/o/sec/s/tag/ok/"
+        bad = "/en/org/o/sec/s/num/abc/"
+        first = resolve(good_fr, self.urlconf)
+        for _ in range(3):
+            self.assertNoMatch(bad)
+            match_fr = resolve(good_fr, self.urlconf)
+            match_en = resolve(good_en, self.urlconf)
+            self.assertEqual(match_fr.kwargs, first.kwargs)
+            self.assertEqual(match_fr.view_name, first.view_name)
+            self.assertEqual(match_en.view_name, "resolved-paths-mid:resolved-paths-inner:tag")
+            self.assertEqual(match_en.kwargs, {"org": "o", "section": "s", "tag": "ok"})
+
+    def test_failure_then_success_matches_direct_call(self):
+        for bad in [
+            "/en/org/missing/",
+            "/en/org/o/sec/s/num//",
+            "/en/org/o/sec/s/num/abc/",
+            "/de/org/o/sec/s/num/1/",
+        ]:
+            self.assertNoMatch(bad)
+        direct = resolve("/en/org/o/sec/s/num/11/", self.urlconf)
+        after_failures = resolve("/en/org/o/sec/s/num/11/", self.urlconf)
+        self.assertEqual(after_failures.view_name, direct.view_name)
+        self.assertEqual(after_failures.kwargs, direct.kwargs)
+        self.assertEqual(after_failures.namespaces, direct.namespaces)
+        self.assertEqual(after_failures.route, direct.route)
+
+    def test_legacy_re_path_routes_match_the_raw_path(self):
+        # re_path() captures are not percent-decoded, and malformed-looking
+        # escapes are harmless to a raw-text legacy route.
+        match = resolve("/en/org/o/sec/s/legacy/a%2Fb/", self.urlconf)
+        self.assertEqual(
+            match.view_name, "resolved-paths-mid:resolved-paths-inner:legacy"
+        )
+        self.assertEqual(match.kwargs["token"], "a%2Fb")
+        match = resolve("/en/org/o/sec/s/legacy/100%zz/", self.urlconf)
+        self.assertEqual(match.kwargs["token"], "100%zz")
+
+    def test_legacy_unprefixed_root_routes_unchanged(self):
+        match = resolve("/old-style/42/", self.urlconf)
+        self.assertEqual(match.view_name, "old-style")
+        self.assertEqual(match.kwargs, {"code": "42"})
+        match = resolve("/plain/5/", self.urlconf)
+        self.assertEqual(match.view_name, "plain")
+        self.assertEqual(match.kwargs, {"id": 5})
+
+
+@override_settings(
+    ROOT_URLCONF="urlpatterns_reverse.resolved_paths_urls_unprefixed",
+    LANGUAGE_CODE="en",
+    LANGUAGES=[("en", "English"), ("fr", "French")],
+    USE_I18N=True,
+)
+class ResolveForwardMatchUnprefixedDefaultTests(SimpleTestCase):
+    urlconf = "urlpatterns_reverse.resolved_paths_urls_unprefixed"
+
+    def test_bare_default_and_public_prefix_hit_one_view(self):
+        bare = resolve("/org/o/sec/s/num/2/", self.urlconf)
+        explicit_default = resolve("/en/org/o/sec/s/num/2/", self.urlconf)
+        french = resolve("/fr/org/o/sec/s/num/2/", self.urlconf)
+        for match in (bare, explicit_default, french):
+            self.assertEqual(
+                match.view_name,
+                "resolved-paths-mid:resolved-paths-inner:num",
+            )
+            self.assertEqual(match.kwargs, {"org": "o", "section": "s", "pk": 2})
+
+    def test_bare_path_uses_default_language_routes(self):
+        from django.utils import translation
+
+        with translation.override("fr"):
+            # Even with another active language, a bare path is the default
+            # language's namespace/view deterministically.
+            match = resolve("/org/o/sec/s/num/2/", self.urlconf)
+            self.assertEqual(
+                match.view_name,
+                "resolved-paths-mid:resolved-paths-inner:num",
+            )
+            self.assertEqual(translation.get_language(), "fr")
+
+
 @override_settings(ROOT_URLCONF="urlpatterns_reverse.reverse_lazy_urls")
 class ReverseLazyTest(TestCase):
     def test_redirect_with_lazy_reverse(self):
