@@ -1409,61 +1409,329 @@ class OneToOneField(ForeignKey):
         return []
 
 
+class ManyToManyCompositeForeignObject(ForeignObject):
+    """
+    Virtual multi-column relation used by the automatically generated
+    intermediary model of a many-to-many relation to describe a link to a
+    model with a composite primary key.
+
+    The relation itself does not have a column (``concrete = False``); one
+    concrete column per component of the target's primary key stores the
+    actual values. As for :class:`ForeignObject`, no database-level foreign
+    key constraint is created; referential actions are performed by the ORM.
+    """
+
+    requires_unique_target = True
+    related_accessor_class = ReverseManyToOneDescriptor
+    forward_related_accessor_class = ForwardManyToOneDescriptor
+
+    # No database constraint is emitted for the virtual multi-column link.
+    db_constraint = False
+
+    def __init__(
+        self,
+        to,
+        *,
+        related_name,
+        component_fields,
+        to_field_names,
+    ):
+        self.component_fields = tuple(component_fields)
+        self.to_field_names = tuple(to_field_names)
+        super().__init__(
+            to,
+            on_delete=CASCADE,
+            from_fields=[],
+            to_fields=[],
+            related_name=related_name,
+        )
+
+    def contribute_to_class(self, cls, name, private_only=False, **kwargs):
+        # from_fields/to_fields can only be resolved once the concrete
+        # component fields exist on the intermediary model.
+        self.from_fields = [f.name for f in self.component_fields]
+        self.to_fields = list(self.to_field_names)
+        super().contribute_to_class(cls, name, private_only=private_only, **kwargs)
+
+    def get_attname_column(self):
+        # The virtual relation carries no column of its own.
+        return self.name, None
+
+    def db_type(self, connection):
+        return None
+
+
+def _make_many_to_many_component_field(component, link_name, field_name):
+    """
+    Create a concrete column on the intermediary model that stores one
+    component of a composite primary key. The column mirrors the type and
+    value conversions of the referenced component field.
+
+    ``field_name`` is the name of the component as declared in the target's
+    :class:`CompositePrimaryKey`; the local column is named
+    ``"<link_name>_<field_name>"``.
+    """
+    from django.db.models.fields import (
+        AutoField,
+        BigAutoField,
+        SmallAutoField,
+    )
+    from django.utils.module_loading import import_string
+
+    # A component may itself be a ForeignKey/OneToOneField (e.g. a "tenant"
+    # field); the intermediary stores its scalar target value instead. The
+    # target field is resolved from the registered related model rather than
+    # through the ForeignKey itself, whose own lazy resolution may not have
+    # run yet when models are rendered from migration state.
+    if isinstance(component, ForeignKey):
+        related = component.remote_field.model
+        if isinstance(related, str):
+            related = component.model._meta.apps.get_model(
+                *make_model_tuple(related)
+            )
+        # The local column keeps the component name declared on the composite
+        # primary key; only its type mirrors the FK's scalar target field.
+        target_name = component.remote_field.field_name
+        referenced = (
+            related._meta.get_field(target_name) if target_name else related._meta.pk
+        )
+    else:
+        referenced = component
+    _name, field_path, args, kwargs = referenced.deconstruct()
+    field_class = import_string(field_path)
+    # Auto-generated key components are stored as their plain scalar type.
+    if isinstance(referenced, BigAutoField):
+        field_class = import_string("django.db.models.BigIntegerField")
+    elif isinstance(referenced, SmallAutoField):
+        field_class = import_string("django.db.models.SmallIntegerField")
+    elif isinstance(referenced, AutoField):
+        field_class = import_string("django.db.models.IntegerField")
+    # Drop attributes that are defined by the intermediary relation itself.
+    for attr in (
+        "primary_key",
+        "unique",
+        "db_index",
+        "null",
+        "blank",
+        "default",
+        "db_default",
+        "editable",
+        "serialize",
+        "db_column",
+        "db_tablespace",
+        "db_comment",
+    ):
+        kwargs.pop(attr, None)
+    component_field = field_class(*args, **kwargs)
+    component_field.referenced_field = referenced
+    component_field.primary_key = False
+    component_field.unique = False
+    component_field.db_index = False
+    component_field.null = False
+    component_field.blank = False
+    component_field.editable = False
+    component_field.serialize = False
+    component_field.auto_created = True
+    component_field.set_attributes_from_name("%s_%s" % (link_name, field_name))
+    return component_field
+
+
+def _m2m_link_columns(link_field):
+    """
+    Return the concrete database column name(s) backing an intermediary link
+    field. A link to a model with a composite primary key spans several
+    columns; every other link spans a single column.
+    """
+    columns = [f.column for f in link_field.local_related_fields]
+    return columns if columns else [link_field.column]
+
+
+def _m2m_column_attr_value(link_field):
+    """
+    Value returned by ``m2m_column_name()``/``m2m_reverse_name()``: a single
+    column name for a regular link, or a list of column names for a link to a
+    model with a composite primary key.
+    """
+    columns = _m2m_link_columns(link_field)
+    return columns[0] if len(columns) == 1 else columns
+
+
 def create_many_to_many_intermediary_model(field, klass):
-    from django.db import models
+    from django.db.models.fields.composite import CompositePrimaryKey
 
     def set_managed(model, related, through):
         through._meta.managed = model._meta.managed or related._meta.managed
 
-    to_model = resolve_relation(klass, field.remote_field.model)
+    resolved_to_model = resolve_relation(klass, field.remote_field.model)
     name = "%s_%s" % (klass._meta.object_name, field.name)
-    lazy_related_operation(set_managed, klass, to_model, name)
 
-    to = make_model_tuple(to_model)[1]
-    from_ = klass._meta.model_name
-    if to == from_:
-        to = "to_%s" % to
-        from_ = "from_%s" % from_
+    def build(to_model, *, defer_composite=False):
+        from django.db import models
 
-    meta = type(
-        "Meta",
-        (),
-        {
-            "db_table": field._get_m2m_db_table(klass._meta),
-            "auto_created": klass,
-            "app_label": klass._meta.app_label,
-            "db_tablespace": klass._meta.db_tablespace,
-            "unique_together": (from_, to),
-            "verbose_name": _("%(from)s-%(to)s relationship")
-            % {"from": from_, "to": to},
-            "verbose_name_plural": _("%(from)s-%(to)s relationships")
-            % {"from": from_, "to": to},
-            "apps": field.model._meta.apps,
-        },
-    )
-    # Construct and return the new class.
-    return type(
-        name,
-        (models.Model,),
-        {
+        to = make_model_tuple(to_model)[1]
+        from_ = klass._meta.model_name
+        if to == from_:
+            to = "to_%s" % to
+            from_ = "from_%s" % from_
+
+        def build_link(model, link_name, defer_composite=False):
+            """
+            Return ``(relation_field, component_fields)`` describing a link to
+            ``model`` on the intermediary model.
+
+            A single-column ForeignKey is used when the target has a single
+            primary key; otherwise a virtual multi-column ForeignObject is
+            created together with one concrete column per component of the
+            target's composite primary key.
+            """
+            pk = model._meta.pk if not isinstance(model, str) else None
+            is_composite = isinstance(pk, CompositePrimaryKey)
+            if (defer_composite and is_composite) or isinstance(model, str):
+                # While the related model is only known by name (e.g. it is
+                # not loaded yet, or never exists), the provisional link is a
+                # single-column ForeignKey. A composite link is built once
+                # every referenced model is available.
+                is_composite = False
+            if not is_composite:
+                return (
+                    models.ForeignKey(
+                        model,
+                        related_name="%s+" % name,
+                        db_tablespace=field.db_tablespace,
+                        db_constraint=field.remote_field.db_constraint,
+                        on_delete=CASCADE,
+                    ),
+                    [],
+                )
+            component_fields = [
+                _make_many_to_many_component_field(component, link_name, field_name)
+                for field_name, component in zip(pk.field_names, pk.fields, strict=True)
+            ]
+            relation = ManyToManyCompositeForeignObject(
+                model,
+                related_name="%s+" % name,
+                component_fields=component_fields,
+                to_field_names=pk.field_names,
+            )
+            return relation, component_fields
+
+        from_relation, from_components = build_link(
+            klass, from_, defer_composite=defer_composite
+        )
+        to_relation, to_components = build_link(
+            to_model, to, defer_composite=defer_composite
+        )
+
+        # The uniqueness constraint covers all link columns: one column for a
+        # single primary key, one column per component for a composite key.
+        unique_field_names = [component.name for component in from_components]
+        if not from_components:
+            unique_field_names.append(from_)
+        unique_field_names.extend(component.name for component in to_components)
+        if not to_components:
+            unique_field_names.append(to)
+        meta = type(
+            "Meta",
+            (),
+            {
+                "db_table": field._get_m2m_db_table(klass._meta),
+                "auto_created": klass,
+                "app_label": klass._meta.app_label,
+                "db_tablespace": klass._meta.db_tablespace,
+                "unique_together": (tuple(unique_field_names),),
+                "verbose_name": _("%(from)s-%(to)s relationship")
+                % {"from": from_, "to": to},
+                "verbose_name_plural": _("%(from)s-%(to)s relationships")
+                % {"from": from_, "to": to},
+                "apps": field.model._meta.apps,
+            },
+        )
+        attrs = {
             "Meta": meta,
             "__module__": klass.__module__,
-            from_: models.ForeignKey(
-                klass,
-                related_name="%s+" % name,
-                db_tablespace=field.db_tablespace,
-                db_constraint=field.remote_field.db_constraint,
-                on_delete=CASCADE,
-            ),
-            to: models.ForeignKey(
-                to_model,
-                related_name="%s+" % name,
-                db_tablespace=field.db_tablespace,
-                db_constraint=field.remote_field.db_constraint,
-                on_delete=CASCADE,
-            ),
-        },
+            from_: from_relation,
+            to: to_relation,
+        }
+        for component in [*from_components, *to_components]:
+            attrs[component.name] = component
+        # Construct and return the new class.
+        through = type(name, (models.Model,), attrs)
+        if not isinstance(to_model, str):
+            set_managed(klass, to_model, through)
+        return through
+
+    # Always build a provisional intermediary model eagerly. When either side
+    # is still a string reference (the related model is not imported yet) the
+    # provisional links are single-column ForeignKeys - exactly as for a model
+    # that never exists, so a dangling reference is also reported for the
+    # through link. The same provisional build is needed when the field lives
+    # on a concrete subclass of an abstract model with a composite primary
+    # key: the inherited key components are copied onto the class only after
+    # this many-to-many field has contributed itself.
+    provisional = build(
+        resolved_to_model,
+        defer_composite=isinstance(resolved_to_model, str),
     )
+
+    apps_registry = field.model._meta.apps
+
+    def finalize(from_model, to_model):
+        set_managed(from_model, to_model, provisional)
+        source_is_composite = isinstance(from_model._meta.pk, CompositePrimaryKey)
+        target_is_composite = isinstance(to_model._meta.pk, CompositePrimaryKey)
+        if not (source_is_composite or target_is_composite):
+            # The provisional single-column intermediary model is final.
+            field.remote_field.through = provisional
+            return
+
+        app_label = provisional._meta.app_label
+        model_name = provisional._meta.model_name
+
+        def rebuild():
+            # Drop the provisional model so the composite intermediary model
+            # can register under the same name without a reload warning.
+            apps_registry.all_models[app_label].pop(model_name, None)
+            app_config = apps_registry.app_configs.get(app_label)
+            if app_config is not None:
+                app_config.models.pop(model_name, None)
+            apps_registry.clear_cache()
+            field.remote_field.through = build(to_model)
+
+        # A composite primary key may contain a ForeignKey component; wait for
+        # those related models too so the scalar target fields can be
+        # resolved when models are rendered from migration state.
+        fk_targets = []
+        for composite_model in (from_model, to_model):
+            if not isinstance(composite_model._meta.pk, CompositePrimaryKey):
+                continue
+            for component in composite_model._meta.pk.fields:
+                if isinstance(component, ForeignKey):
+                    fk_targets.append(
+                        resolve_relation(composite_model, component.remote_field.model)
+                    )
+        if fk_targets:
+            lazy_related_operation(
+                lambda *resolved: rebuild(),
+                klass,
+                *dict.fromkeys(fk_targets),
+            )
+        else:
+            rebuild()
+
+    if isinstance(resolved_to_model, str):
+        lazy_related_operation(finalize, klass, resolved_to_model)
+    else:
+        # The related model is available, but the source model's composite
+        # primary key may not yet have been inherited from an abstract base.
+        # Finalize once model registration finishes: enqueue the operation
+        # keyed on the source model itself; if it was already registered the
+        # registry runs it immediately, otherwise it runs when inherited
+        # fields are in place.
+        apps_registry.lazy_model_operation(
+            lambda from_model: finalize(from_model, resolved_to_model),
+            make_model_tuple(klass),
+        )
+    return provisional
 
 
 class ManyToManyField(RelatedField):
@@ -1609,6 +1877,11 @@ class ManyToManyField(RelatedField):
     def _check_relationship_model(self, from_model=None, **kwargs):
         from django.db.models.fields.composite import CompositePrimaryKey
 
+        if self.remote_field.through is None:
+            # The related model could not be resolved (missing or abstract);
+            # the absence of the relation is reported elsewhere (fields.E300).
+            return []
+
         if hasattr(self.remote_field.through, "_meta"):
             qualified_model_name = "%s.%s" % (
                 self.remote_field.through._meta.app_label,
@@ -1649,9 +1922,18 @@ class ManyToManyField(RelatedField):
                 to_model, str
             ):
                 model_name = None
-                if isinstance(to_model._meta.pk, CompositePrimaryKey):
+                # A relation to a model with a composite primary key is
+                # supported through the automatically generated intermediary
+                # model. An explicit ``through`` model cannot describe such a
+                # multi-column link on its own and remains unsupported.
+                explicit_through = self.remote_field.through._meta.auto_created is False
+                if explicit_through and isinstance(
+                    to_model._meta.pk, CompositePrimaryKey
+                ):
                     model_name = self.remote_field.model._meta.object_name
-                elif isinstance(from_model._meta.pk, CompositePrimaryKey):
+                elif explicit_through and isinstance(
+                    from_model._meta.pk, CompositePrimaryKey
+                ):
                     model_name = from_model_name
                 if model_name:
                     errors.append(
@@ -1863,7 +2145,8 @@ class ManyToManyField(RelatedField):
 
     def _check_table_uniqueness(self, **kwargs):
         if (
-            isinstance(self.remote_field.through, str)
+            self.remote_field.through is None
+            or isinstance(self.remote_field.through, str)
             or not self.remote_field.through._meta.managed
         ):
             return []
@@ -1916,7 +2199,8 @@ class ManyToManyField(RelatedField):
     def _check_on_delete(self, **kwargs):
         errors = []
         if (
-            isinstance(self.remote_field.through, str)
+            self.remote_field.through is None
+            or isinstance(self.remote_field.through, str)
             or not self.remote_field.through._meta.auto_created
         ):
             # Manually created through models are checked on their own.
@@ -2079,8 +2363,12 @@ class ManyToManyField(RelatedField):
                 and f.remote_field.model == related.related_model
                 and (link_field_name is None or link_field_name == f.name)
             ):
-                setattr(self, cache_attr, getattr(f, attr))
-                return getattr(self, cache_attr)
+                if attr == "column":
+                    value = _m2m_column_attr_value(f)
+                else:
+                    value = getattr(f, attr)
+                setattr(self, cache_attr, value)
+                return value
 
     def _get_m2m_reverse_attr(self, related, attr):
         """
@@ -2103,12 +2391,20 @@ class ManyToManyField(RelatedField):
                     # the source column. Keep searching for
                     # the second foreign key.
                     if found:
-                        setattr(self, cache_attr, getattr(f, attr))
+                        if attr == "column":
+                            value = _m2m_column_attr_value(f)
+                        else:
+                            value = getattr(f, attr)
+                        setattr(self, cache_attr, value)
                         break
                     else:
                         found = True
                 elif link_field_name is None or link_field_name == f.name:
-                    setattr(self, cache_attr, getattr(f, attr))
+                    if attr == "column":
+                        value = _m2m_column_attr_value(f)
+                    else:
+                        value = getattr(f, attr)
+                    setattr(self, cache_attr, value)
                     break
         return getattr(self, cache_attr)
 

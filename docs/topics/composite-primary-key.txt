@@ -112,6 +112,17 @@ Composite primary keys and relations
 :ref:`Relationship fields <relationship-fields>`, such as ``ForeignKey`` do
 not support composite primary keys.
 
+:class:`~django.db.models.ManyToManyField` supports relations that involve a
+model with a composite primary key on either side (or both). No custom
+intermediary model is required: the automatically generated intermediary
+model stores one column per component of each composite primary key, with a
+uniqueness constraint across all of the link columns. Reading, filtering,
+counting, prefetching, ``add()``, ``set()``, ``remove()``, ``clear()``,
+``create()``, ``get_or_create()`` and ``update_or_create()`` all match on the
+complete composite key, so two objects that merely share one component are
+never treated as the same relation. An explicit ``through`` model is not
+supported; let Django generate the intermediary model.
+
 :class:`~django.contrib.contenttypes.fields.GenericForeignKey` and
 :class:`~django.contrib.contenttypes.fields.GenericRelation` do support
 models with a composite primary key; the reference to such an object is
@@ -130,8 +141,14 @@ supported::
 Because ``ForeignKey`` currently cannot reference models with composite primary
 keys.
 
-To work around this limitation, ``ForeignObject`` can be used as an
-alternative::
+A many-to-many relation is supported directly::
+
+    class Tag(models.Model):
+        label = models.CharField(max_length=50)
+        tagged_items = models.ManyToManyField(OrderLineItem)
+
+To work around the ``ForeignKey`` limitation, ``ForeignObject`` can be used
+as an alternative::
 
     class Foo(models.Model):
         item_order_id = models.CharField(max_length=20)

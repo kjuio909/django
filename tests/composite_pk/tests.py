@@ -355,7 +355,9 @@ class CompositePKFixturesTests(TestCase):
                     "pk": [1, 1],
                     "fields": {
                         "email": "user0001@example.com",
+                        "followers": [],
                         "id": 1,
+                        "tags": [],
                         "tenant": 1,
                     },
                 }
@@ -373,7 +375,9 @@ class CompositePKFixturesTests(TestCase):
                 "pk": [1, 2],
                 "fields": {
                     "email": "user0002@example.com",
+                    "followers": [],
                     "id": 2,
+                    "tags": [],
                     "tenant": 1,
                 },
             },
@@ -411,7 +415,9 @@ class CompositePKFixturesTests(TestCase):
                     "pk": [2, 4],
                     "fields": {
                         "email": "user0004@example.com",
+                        "followers": [],
                         "id": 4,
+                        "tags": [],
                         "tenant": 2,
                     },
                 },

@@ -25,7 +25,14 @@ class AbstractUser(models.Model):
 
 
 class User(AbstractUser):
-    pass
+    # A many-to-many relation declared on a model with a composite primary
+    # key to a single-primary-key model.
+    tags = models.ManyToManyField("Tag", related_name="tagged_users")
+    # A non-symmetrical self-referential many-to-many relation on a model
+    # with a composite primary key.
+    followers = models.ManyToManyField(
+        "self", symmetrical=False, related_name="following"
+    )
 
 
 class Comment(models.Model):
@@ -66,3 +73,34 @@ class TimeStamped(models.Model):
     id = models.SmallIntegerField(unique=True)
     created = models.DateTimeField(auto_now_add=True)
     text = models.TextField(default="", blank=True)
+
+
+class Tag(models.Model):
+    title = models.CharField(max_length=50)
+
+
+class PostTag(models.Model):
+    # The auto-generated intermediary model of a many-to-many relation to a
+    # model with a composite primary key stores every component of the key.
+    posts = models.ManyToManyField(Post, related_name="post_tags")
+    users = models.ManyToManyField(User, related_name="post_tag_set")
+
+
+class Role(models.Model):
+    pk = models.CompositePrimaryKey("tenant_id", "code")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    code = models.SlugField(max_length=20)
+    users = models.ManyToManyField(User, related_name="roles")
+
+
+class Country(models.Model):
+    # A composite primary key made of free-text components, used to verify
+    # that unusual key values round-trip through a many-to-many relation.
+    pk = models.CompositePrimaryKey("region", "code")
+    region = models.CharField(max_length=30)
+    code = models.CharField(max_length=30)
+    teams = models.ManyToManyField("Team", related_name="countries")
+
+
+class Team(models.Model):
+    name = models.CharField(max_length=30)

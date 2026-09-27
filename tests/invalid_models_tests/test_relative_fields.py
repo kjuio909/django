@@ -484,18 +484,31 @@ class RelativeFieldTests(SimpleTestCase):
                 "Parent", related_name="child_string_set"
             )
 
+        # The auto-generated intermediary model supports a relation to a model
+        # with a composite primary key.
+        field = Child._meta.get_field("rel_string_parent")
+        self.assertEqual(field.check(from_model=Child), [])
+        field = Child._meta.get_field("rel_class_parent")
+        self.assertEqual(field.check(from_model=Child), [])
+
+        class Relation(models.Model):
+            child = models.ForeignKey(Child, models.CASCADE)
+            parent = models.ForeignKey(Parent, models.CASCADE)
+
+        class ChildWithThrough(models.Model):
+            parents = models.ManyToManyField(Parent, through=Relation)
+
         error = (
             "Field defines a relation involving model 'Parent' which has a "
             "CompositePrimaryKey and such relations are not supported."
         )
-        field = Child._meta.get_field("rel_string_parent")
+        field = ChildWithThrough._meta.get_field("parents")
         self.assertEqual(
-            field.check(from_model=Child),
-            [Error(error, obj=field, id="fields.E347")],
-        )
-        field = Child._meta.get_field("rel_class_parent")
-        self.assertEqual(
-            field.check(from_model=Child),
+            [
+                e
+                for e in field.check(from_model=ChildWithThrough)
+                if e.id == "fields.E347"
+            ],
             [Error(error, obj=field, id="fields.E347")],
         )
 
@@ -515,13 +528,32 @@ class RelativeFieldTests(SimpleTestCase):
             class Meta:
                 app_label = "invalid_models_tests"
 
+        # The auto-generated intermediary model supports a relation from a
+        # model with a composite primary key.
+        field = Child._meta.get_field("parents")
+        self.assertEqual(field.check(from_model=Child), [])
+
+        class Relation(models.Model):
+            child = models.ForeignKey(Child, models.CASCADE)
+            parent = models.ForeignKey(Parent, models.CASCADE)
+
+        class ParentWithThrough(models.Model):
+            children = models.ManyToManyField(Child, through=Relation)
+
+            class Meta:
+                app_label = "invalid_models_tests"
+
         error = (
             "Field defines a relation involving model 'Child' which has a "
             "CompositePrimaryKey and such relations are not supported."
         )
-        field = Child._meta.get_field("parents")
+        field = ParentWithThrough._meta.get_field("children")
         self.assertEqual(
-            field.check(from_model=Child),
+            [
+                e
+                for e in field.check(from_model=ParentWithThrough)
+                if e.id == "fields.E347"
+            ],
             [Error(error, obj=field, id="fields.E347")],
         )
 

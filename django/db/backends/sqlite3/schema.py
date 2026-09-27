@@ -451,25 +451,25 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
 
         # Make a new through table
         self.create_model(new_field.remote_field.through)
+
+        def _columns(m2m_field, get_columns):
+            # Each side of the relation maps to one column for a single
+            # primary key and to one column per component for a composite
+            # primary key.
+            value = get_columns()
+            return value if isinstance(value, (list, tuple)) else [value]
+
+        new_columns = ["id", *_columns(new_field, new_field.m2m_column_name)]
+        new_columns.extend(_columns(new_field, new_field.m2m_reverse_name))
+        old_columns = ["id", *_columns(old_field, old_field.m2m_column_name)]
+        old_columns.extend(_columns(old_field, old_field.m2m_reverse_name))
         # Copy the data across
         self.execute(
             "INSERT INTO %s (%s) SELECT %s FROM %s"
             % (
                 self.quote_name(new_field.remote_field.through._meta.db_table),
-                ", ".join(
-                    [
-                        "id",
-                        new_field.m2m_column_name(),
-                        new_field.m2m_reverse_name(),
-                    ]
-                ),
-                ", ".join(
-                    [
-                        "id",
-                        old_field.m2m_column_name(),
-                        old_field.m2m_reverse_name(),
-                    ]
-                ),
+                ", ".join(map(self.quote_name, new_columns)),
+                ", ".join(map(self.quote_name, old_columns)),
                 self.quote_name(old_field.remote_field.through._meta.db_table),
             )
         )
