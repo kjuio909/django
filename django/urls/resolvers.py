@@ -12,7 +12,7 @@ import re
 import string
 from importlib import import_module
 from pickle import PicklingError
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from asgiref.local import Local
 
@@ -245,16 +245,102 @@ _PATH_PARAMETER_COMPONENT_RE = _lazy_re_compile(
 
 whitespace_set = frozenset(string.whitespace)
 
+@functools.lru_cache
+def _compiled_converter_regex(regex):
+    return re.compile(regex)
+
+
+# A well-formed percent-encoded octet, e.g. "%2F" or "%c3".
+_PERCENT_ENCODED_RE = r"%[0-9A-Fa-f]{2}"
+# A literal '%' that does not begin a well-formed escape. It is disjoint
+# from _PERCENT_ENCODED_RE, so the two alternatives can never compete for
+# the same input (which would make matching exponentially ambiguous).
+_LONE_PERCENT_RE = r"%(?![0-9A-Fa-f]{2})"
+
+
+def _match_capture(parameter, converter_regex):
+    # The raw-path counterpart of a converter's capture. Matching runs
+    # against the still-encoded path so that an encoded slash ("%2F")
+    # cannot introduce a new path level. The pieces are pairwise disjoint
+    # and fixed-width, so an input string has a single possible split and
+    # matching stays linear:
+    #   * a well-formed percent escape is consumed as one 3-character token
+    #     and decoded later (an encoded slash can therefore never open a new
+    #     path level),
+    #   * a lone, non-escape '%' is only accepted when the converter itself
+    #     accepts '%' (the path may already have been decoded once by WSGI),
+    #   * everything else is matched by the converter's own regex, whose
+    #     greediness still decides where the capture ends relative to route
+    #     literals (so <int:pk>-<slug:slug> cannot let '-' bleed into pk).
+    # The decoded capture is re-validated against the converter regex before
+    # conversion, so broadening it with escapes cannot let an invalid value
+    # through.
+    escape = _PERCENT_ENCODED_RE
+    if "%" not in converter_regex and _compiled_converter_regex(
+        converter_regex
+    ).fullmatch("%") is None:
+        # The converter never involves '%' (built-in int/slug/uuid, most
+        # custom converters). Converter runs and escape tokens are then
+        # disjoint and fixed-width: a run never consumes a '%', so at every
+        # '%' position the escape token is the single possible move. This
+        # keeps the converter's own greediness (so "<int:pk>-<slug:slug>"
+        # cannot let '-' bleed into pk) and matching linear.
+        run = f"(?:{converter_regex})?"
+        token = f"{run}(?:{escape}{run})*"
+    else:
+        # The converter accepts '%' itself (<str>, <path> or a custom
+        # converter whose regex mentions '%'). Raw runs are single
+        # characters taken from everything except '%' (and, when the
+        # converter rejects it, '/'); '%' only reaches them through an
+        # escape or the disjoint lone-percent token. Splitting into
+        # fixed-width single-character tokens prevents an exponentially
+        # ambiguous split when the converter regex would itself match an
+        # escape sequence. Newlines are excluded, mirroring a converter
+        # regex that uses '.'. The post-match fullmatch against the
+        # converter regex keeps its value restrictions.
+        allows_slash = (
+            _compiled_converter_regex(converter_regex).fullmatch("/") is not None
+        )
+        raw_char = r"[^%\n]" if allows_slash else r"[^%/\n]"
+        run = f"(?:{raw_char}|{_LONE_PERCENT_RE})*"
+        token = f"{run}(?:{escape}{run})*"
+    return f"(?P<{parameter}>{token})"
+
+
+def _decode_route_capture(value):
+    """
+    Percent-decode a captured route component exactly once.
+
+    The resolver matches the raw path, so every captured component is
+    decoded here before being handed to its converter. Decoding follows
+    urllib's lenient rules: every well-formed percent-encoded octet is
+    decoded once (so "%252F" becomes the literal text "%2F" rather than
+    "/"), while a '%' that does not introduce a well-formed escape is left
+    untouched because the path may already have been decoded once by WSGI.
+    The decoded bytes must be valid UTF-8; otherwise ValueError is raised so
+    the caller treats the route as non-matching rather than returning
+    replacement characters.
+    """
+    if "%" not in value:
+        return value
+    try:
+        return unquote(value, errors="strict")
+    except UnicodeDecodeError as e:
+        raise ValueError("Route component is not valid UTF-8") from e
+
 
 @functools.lru_cache
 def _route_to_regex(route, is_endpoint):
     """
     Convert a path pattern into a regular expression. Return the regular
-    expression and a dictionary mapping the capture names to the converters.
-    For example, 'foo/<int:pk>' returns '^foo\\/(?P<pk>[0-9]+)'
-    and {'pk': <django.urls.converters.IntConverter>}.
+    expression used for reversing, the regular expression used for matching
+    raw (still percent-encoded) paths, and a dictionary mapping the capture
+    names to the converters. For example, 'foo/<int:pk>' returns
+    '^foo\\/(?P<pk>[0-9]+)', a match regex that also accepts percent-encoded
+    octets in the capture, and {'pk': <django.urls.converters.IntConverter>}.
     """
     parts = ["^"]
+    match_parts = ["^"]
     all_converters = get_converters()
     converters = {}
     previous_end = 0
@@ -280,14 +366,20 @@ def _route_to_regex(route, is_endpoint):
         converters[parameter] = converter
 
         start, end = match_.span()
-        parts.append(re.escape(route[previous_end:start]))
+        literal = re.escape(route[previous_end:start])
         previous_end = end
+        parts.append(literal)
+        match_parts.append(literal)
         parts.append(f"(?P<{parameter}>{converter.regex})")
+        match_parts.append(_match_capture(parameter, converter.regex))
 
-    parts.append(re.escape(route[previous_end:]))
+    tail = re.escape(route[previous_end:])
+    parts.append(tail)
+    match_parts.append(tail)
     if is_endpoint:
         parts.append(r"\Z")
-    return "".join(parts), converters
+        match_parts.append(r"\Z")
+    return "".join(parts), "".join(match_parts), converters
 
 
 class LocaleRegexRouteDescriptor:
@@ -311,28 +403,68 @@ class LocaleRegexRouteDescriptor:
         return instance._regex_dict[language_code]
 
 
+class LocaleRouteMatchRegexDescriptor:
+    def __get__(self, instance, cls=None):
+        """
+        Return the compiled regular expression used to match raw (still
+        percent-encoded) paths, based on the active language.
+        """
+        if instance is None:
+            return self
+        if isinstance(instance._route, str):
+            instance.__dict__["match_regex"] = re.compile(instance._match_regex)
+            return instance.__dict__["match_regex"]
+        language_code = get_language()
+        if language_code not in instance._match_regex_dict:
+            instance._match_regex_dict[language_code] = re.compile(
+                _route_to_regex(str(instance._route), instance._is_endpoint)[1]
+            )
+        return instance._match_regex_dict[language_code]
+
+
 class RoutePattern(CheckURLMixin):
     regex = LocaleRegexRouteDescriptor()
+    match_regex = LocaleRouteMatchRegexDescriptor()
 
     def __init__(self, route, name=None, is_endpoint=False):
         self._route = route
-        self._regex, self.converters = _route_to_regex(str(route), is_endpoint)
+        self._regex, self._match_regex, self.converters = _route_to_regex(
+            str(route), is_endpoint
+        )
         self._regex_dict = {}
+        self._match_regex_dict = {}
         self._is_endpoint = is_endpoint
         self.name = name
 
     def match(self, path):
         # Only use regex overhead if there are converters.
         if self.converters:
-            if match := self.regex.search(path):
+            if match := self.match_regex.search(path):
                 # RoutePattern doesn't allow non-named groups so args are
                 # ignored.
                 kwargs = match.groupdict()
                 for key, value in kwargs.items():
                     converter = self.converters[key]
                     try:
-                        kwargs[key] = converter.to_python(value)
-                    except ValueError:
+                        # Matching runs against the raw, still-encoded path
+                        # so an encoded slash cannot split a capture into
+                        # path levels. Decode the capture exactly once and
+                        # let the converter validate the decoded value; a
+                        # bad UTF-8 sequence or a value the converter
+                        # rejects makes the whole pattern non-matching.
+                        decoded = _decode_route_capture(value)
+                        # The match regex admits percent escapes in addition
+                        # to the converter's own characters; re-check the
+                        # decoded value against the converter's regex so an
+                        # escape cannot smuggle in a disallowed character
+                        # (an encoded slash into a <slug>, a space into an
+                        # <int>, and so on).
+                        if not _compiled_converter_regex(converter.regex).fullmatch(
+                            decoded
+                        ):
+                            return None
+                        kwargs[key] = converter.to_python(decoded)
+                    except Exception:
                         return None
                 return path[match.end() :], (), kwargs
         # If this is an endpoint, the path should be exactly the same as the

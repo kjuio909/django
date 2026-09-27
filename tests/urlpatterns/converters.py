@@ -36,3 +36,15 @@ class DynamicConverter:
     @classmethod
     def register_to_url(cls, value):
         cls._dynamic_to_url = value
+
+
+class DecodedIntConverter:
+    # The resolver percent-decodes captures exactly once before calling
+    # to_python(), which only has to validate the decoded value.
+    regex = "[0-9]+"
+
+    def to_python(self, value):
+        return int(value)
+
+    def to_url(self, value):
+        return str(value)

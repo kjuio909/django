@@ -14,6 +14,7 @@ from django.urls import (
     reverse,
 )
 from django.urls.converters import REGISTERED_CONVERTERS, IntConverter
+from django.utils.translation import override
 from django.views import View
 
 from .converters import Base64Converter, DynamicConverter
@@ -413,12 +414,15 @@ class ConversionExceptionTests(SimpleTestCase):
         with self.assertRaises(Resolver404):
             resolve("/dynamic/abc/")
 
-    def test_resolve_type_error_propagates(self):
+    def test_resolve_type_error_means_no_match(self):
+        # Any exception from a converter's to_python() -- not just
+        # ValueError -- reports a plain resolution failure so that converter
+        # internals never leak through resolve().
         @DynamicConverter.register_to_python
         def raises_type_error(value):
-            raise TypeError("This type error propagates.")
+            raise TypeError("This type error does not propagate.")
 
-        with self.assertRaisesMessage(TypeError, "This type error propagates."):
+        with self.assertRaises(Resolver404):
             resolve("/dynamic/abc/")
 
     def test_reverse_value_error_means_no_match(self):
@@ -436,3 +440,195 @@ class ConversionExceptionTests(SimpleTestCase):
 
         with self.assertRaisesMessage(TypeError, "This type error propagates."):
             reverse("dynamic", kwargs={"value": object()})
+
+
+@override_settings(ROOT_URLCONF="urlpatterns.encoded_urls")
+class EncodedPathResolveTests(SimpleTestCase):
+    """
+    django.urls.resolve() on a modular URLconf (two levels of include(),
+    application namespaces, language prefixes, trailing slashes and typed
+    converters) must map concrete, possibly percent-encoded, paths to a
+    single view and reconstruct the business parameters.
+    """
+
+    def test_nested_includes_view_name_and_namespace_chain(self):
+        match = resolve("/org/12/sec/news/article/42/")
+        self.assertEqual(match.url_name, "article")
+        self.assertEqual(match.view_name, "mid:inner:article")
+        # Outer-to-inner namespace and app-name order is stable.
+        self.assertEqual(match.namespaces, ["mid", "inner"])
+        self.assertEqual(match.app_names, ["mid", "inner"])
+        # Only genuine captures become parameters; the include prefixes
+        # themselves are not folded into kwargs.
+        self.assertEqual(match.kwargs, {"org": 12, "section": "news", "pk": 42})
+        # The ancestor include captures never masquerade as endpoint
+        # captures.
+        self.assertEqual(match.captured_kwargs, {"pk": 42})
+
+    def test_nested_include_types(self):
+        match = resolve("/org/12/sec/news/article/42/")
+        self.assertIsInstance(match.kwargs["org"], int)
+        self.assertIsInstance(match.kwargs["pk"], int)
+        self.assertIsInstance(match.kwargs["section"], str)
+
+    def test_percent_encoded_unicode_space_and_reserved_characters(self):
+        # caf%C3%A9 -> café, %20 -> space, %3F%26%3D%3A -> ?&=:; decoded
+        # exactly once and left as the converter's declared type (str).
+        match = resolve("/word/caf%C3%A9%20x%3F%26%3D%3A/")
+        self.assertEqual(match.view_name, "plain-word")
+        self.assertEqual(match.kwargs, {"word": "café x?&=:"})
+
+    def test_encoded_digits_convert_to_int(self):
+        match = resolve("/plain/%34%32/")
+        self.assertEqual(match.kwargs, {"pk": 42})
+        self.assertIsInstance(match.kwargs["pk"], int)
+
+    def test_encoded_value_decoded_exactly_once(self):
+        # %252F decodes once to the literal text "%2F", which then fails an
+        # <int> capture rather than becoming a slash or the digit 4.
+        with self.assertRaises(Resolver404):
+            resolve("/plain/%2534/")
+        match = resolve("/org/12/sec/news/file/%252F/")
+        self.assertEqual(match.kwargs["rest"], "%2F")
+
+    def test_custom_converter_gets_decoded_value_and_declared_type(self):
+        match = resolve("/org/12/sec/news/count/%33%37/")
+        self.assertEqual(match.view_name, "mid:inner:count")
+        self.assertEqual(match.kwargs["number"], 37)
+        self.assertIsInstance(match.kwargs["number"], int)
+
+    def test_encoded_slash_is_path_converter_content(self):
+        # %2F stays parameter content for <path>: one parameter, decoded
+        # once, and never split into extra path levels.
+        match = resolve("/org/12/sec/news/file/a%2Fb%2Fc/")
+        self.assertEqual(match.view_name, "mid:inner:file")
+        self.assertEqual(
+            match.kwargs,
+            {"org": 12, "section": "news", "rest": "a/b/c"},
+        )
+
+    def test_encoded_slash_rejected_by_non_path_converters(self):
+        for url in (
+            "/org/12/sec/news/slug/a%2Fb/",
+            "/plain/1%2F2/",
+            "/org/12/sec/news/count/1%2F2/",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(Resolver404):
+                    resolve(url)
+
+    def test_encoded_space_rejected_by_slug_and_int(self):
+        with self.assertRaises(Resolver404):
+            resolve("/org/12/sec/news/slug/a%20b/")
+        with self.assertRaises(Resolver404):
+            resolve("/plain/%20/")
+
+    def test_int_and_slug_empty_or_illegal_values_do_not_hit_siblings(self):
+        for url in (
+            "/plain//",
+            "/plain/abc/",
+            "/plain/-1/",
+            "/plain/1.5/",
+            "/org/12/sec/news/slug//",
+            "/org/12/sec/news/slug/star*bad/",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(Resolver404):
+                    resolve(url)
+
+    def test_malformed_percent_encoding_is_content_not_ignorable_tail(self):
+        # A malformed escape next to a typed capture is part of the value and
+        # fails a converter that cannot accept it; it is never a droppable
+        # suffix that lets the route match.
+        for url in ("/plain/42%/", "/plain/42%ZZ/"):
+            with self.subTest(url=url):
+                with self.assertRaises(Resolver404):
+                    resolve(url)
+        # A permissive converter keeps the malformed sequence verbatim as
+        # parameter content instead of ignoring or re-decoding it.
+        match = resolve("/word/ab%2/")
+        self.assertEqual(match.kwargs, {"word": "ab%2"})
+        match = resolve("/word/%/")
+        self.assertEqual(match.kwargs, {"word": "%"})
+
+    def test_invalid_utf8_does_not_match(self):
+        with self.assertRaises(Resolver404):
+            resolve("/word/%ff%fe/")
+
+    def test_query_string_and_fragment_are_path_content(self):
+        for url in ("/plain/42/?x=1", "/plain/42/#frag"):
+            with self.subTest(url=url):
+                with self.assertRaises(Resolver404):
+                    resolve(url)
+
+    def test_trailing_and_duplicate_slashes_are_significant(self):
+        with self.assertRaises(Resolver404):
+            resolve("/plain/42")
+        with self.assertRaises(Resolver404):
+            resolve("/plain//42/")
+
+    def test_default_arguments_are_restored(self):
+        match = resolve("/org/12/sec/news/defaulted/9/")
+        # A route-defined default for a captured parameter name takes
+        # precedence over the capture (Django's extra-options semantics),
+        # and the unrelated default is restored as well.
+        self.assertEqual(
+            match.kwargs,
+            {"org": 12, "section": "news", "pk": 3, "verified": True},
+        )
+        self.assertEqual(match.captured_kwargs, {"pk": 9})
+        self.assertEqual(match.extra_kwargs, {"pk": 3, "verified": True})
+
+    def test_missing_extra_and_unknown_namespace_fail(self):
+        for url in (
+            "/org/12/sec/news/",
+            "/org/12/sec/news/article/42/extra/",
+            "/org/12/zzz/news/article/42/",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(Resolver404):
+                    resolve(url)
+
+    def test_default_and_switched_language_prefix_hit_same_named_view(self):
+        default = resolve("/en/loc/blue/article/1/")
+        self.assertEqual(default.view_name, "inner:article")
+        self.assertEqual(default.kwargs, {"book": "blue", "pk": 1})
+        with override("fr"):
+            switched = resolve("/fr/loc/red/article/2/")
+        self.assertEqual(switched.view_name, default.view_name)
+        self.assertEqual(switched.namespaces, default.namespaces)
+        self.assertEqual(switched.app_names, default.app_names)
+        self.assertEqual(switched.kwargs, {"book": "red", "pk": 2})
+
+    def test_repeated_and_alternated_resolution_is_stable(self):
+        first = resolve("/org/1/sec/a/article/1/")
+        for _ in range(3):
+            other = resolve("/plain/5/")
+            self.assertEqual(other.view_name, "plain")
+            self.assertEqual(other.kwargs, {"pk": 5})
+            with override("fr"):
+                localized = resolve("/fr/loc/a/article/1/")
+            self.assertEqual(localized.view_name, "inner:article")
+            again = resolve("/org/1/sec/a/article/1/")
+            self.assertEqual(again.view_name, first.view_name)
+            self.assertEqual(again.namespaces, first.namespaces)
+            self.assertEqual(again.app_names, first.app_names)
+            self.assertEqual(again.kwargs, first.kwargs)
+
+    def test_failure_then_success_equals_direct_success(self):
+        with self.assertRaises(Resolver404):
+            resolve("/plain/not-an-int/")
+        after_failure = resolve("/plain/7/")
+        direct = resolve("/plain/7/")
+        self.assertEqual(after_failure.view_name, direct.view_name)
+        self.assertEqual(after_failure.namespaces, direct.namespaces)
+        self.assertEqual(after_failure.kwargs, direct.kwargs)
+
+    def test_legacy_re_path_keeps_raw_match(self):
+        # A non-namespaced regex route keeps its historical behavior: the
+        # capture is the raw, undecoded text and there is no namespace.
+        match = resolve("/legacy/a%2Fb/")
+        self.assertEqual(match.view_name, "legacy")
+        self.assertEqual(match.namespaces, [])
+        self.assertEqual(match.app_names, [])
+        self.assertEqual(match.kwargs, {"rest": "a%2Fb"})
