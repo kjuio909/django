@@ -1,5 +1,6 @@
-from django.urls import include, path, re_path
+from django.urls import include, path, re_path, register_converter
 
+from .converters import ZeroPaddedIntConverter
 from .views import (
     absolute_kwargs_view,
     defaults_view,
@@ -11,9 +12,17 @@ from .views import (
     view_func_from_cbv,
 )
 
+register_converter(ZeroPaddedIntConverter, "zint")
+
 other_patterns = [
     path("non_path_include/", empty_view, name="non_path_include"),
     path("nested_path/", nested_view),
+]
+
+# A nested include whose own pattern carries a converter parameter that the
+# outer include() supplies a default for.
+nested_converter_defaults_patterns = [
+    path("inner/<zint:inner>/", empty_view, name="nested-converter-defaults"),
 ]
 
 urlpatterns = [
@@ -62,6 +71,25 @@ urlpatterns = [
     re_path(r"^weird3/#frag$", empty_view, name="existing-fragment"),
     re_path(r"^weird5/#$", empty_view, name="existing-empty-fragment"),
     path("weird4/?x=1", empty_view, name="existing-query-path"),
+    # Default values filling in-pattern converter parameters. Placed before
+    # the greedy "mixed" pattern so the generated paths resolve back here.
+    path(
+        "converter-default/<zint:pk>/",
+        empty_view,
+        {"pk": 7},
+        name="converter-default",
+    ),
+    path(
+        "converter-default-invalid/<zint:pk>/",
+        empty_view,
+        {"pk": -1},
+        name="converter-default-invalid",
+    ),
+    path(
+        "outer-conv/<zint:outer>/",
+        include(nested_converter_defaults_patterns),
+        {"outer": 3},
+    ),
     re_path(r"^people/(?P<state>\w\w)/(?P<name>\w+)/$", empty_view, name="people3"),
     re_path(r"^people/(?P<state>\w\w)/(?P<name>[0-9])/$", empty_view, name="people4"),
     re_path(r"^people/((?P<state>\w\w)/test)?/(\w+)/$", empty_view, name="people6"),

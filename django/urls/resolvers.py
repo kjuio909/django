@@ -779,7 +779,20 @@ class URLResolver:
                             break
                     if not matches:
                         continue
-                    candidate_subs = kwargs
+                    # The guard above guarantees every parameter absent from
+                    # kwargs has a default. Fill in-pattern parameters from
+                    # their defaults so they are substituted like any other
+                    # captured value -- serialized through their converter and
+                    # validated against the pattern -- instead of crashing on
+                    # the missing key. Defaults for non-pattern parameters are
+                    # only used in the matching check above and never reach the
+                    # URL. kwargs is left untouched.
+                    candidate_subs = {
+                        k: defaults[k]
+                        for k in params
+                        if k in defaults and k not in kwargs
+                    }
+                    candidate_subs.update(kwargs)
                 # Convert the candidate subs to text using Converter.to_url().
                 text_candidate_subs = {}
                 match = True

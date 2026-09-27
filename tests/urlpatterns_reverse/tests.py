@@ -979,6 +979,53 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(url, "/weird2/?x=1&a=100%25#frag")
         self.assertEqual(reverse("existing-query-fragment", query={"a": "100%"}), url)
 
+    def test_reverse_converter_default_serialized(self):
+        # A default that fills an in-pattern converter parameter is rendered
+        # through the converter, not inserted raw or omitted.
+        self.assertEqual(reverse("converter-default"), "/converter-default/007/")
+        # An explicit value still uses the converter serialization.
+        self.assertEqual(
+            reverse("converter-default", kwargs={"pk": 42}),
+            "/converter-default/042/",
+        )
+        # The generated URL resolves back to the same view with the converter's
+        # Python type restored.
+        match = resolve(reverse("converter-default"))
+        self.assertEqual(match.view_name, "converter-default")
+        self.assertEqual(match.kwargs, {"pk": 7})
+        self.assertIsInstance(match.kwargs["pk"], int)
+
+    def test_reverse_converter_default_rejected_is_noreversematch(self):
+        # A default the converter rejects yields NoReverseMatch (never a
+        # partial path), and a following valid call is unaffected.
+        with self.assertRaises(NoReverseMatch):
+            reverse("converter-default-invalid")
+        with self.assertRaises(NoReverseMatch):
+            reverse("converter-default", kwargs={"pk": -5})
+        self.assertEqual(reverse("converter-default"), "/converter-default/007/")
+
+    def test_reverse_nested_converter_default(self):
+        # An ancestor include() default fills a converter parameter on the
+        # include route; no extra separator is introduced and the URL resolves
+        # back to the nested named view with every captured parameter.
+        url = reverse("nested-converter-defaults", kwargs={"inner": 9})
+        self.assertEqual(url, "/outer-conv/003/inner/009/")
+        self.assertEqual(
+            reverse("nested-converter-defaults", kwargs={"outer": 5, "inner": 9}),
+            "/outer-conv/005/inner/009/",
+        )
+        match = resolve(url)
+        self.assertEqual(match.view_name, "nested-converter-defaults")
+        self.assertEqual(match.kwargs, {"outer": 3, "inner": 9})
+        # Repeated and out-of-order calls are byte-identical.
+        self.assertEqual(
+            reverse("nested-converter-defaults", kwargs={"inner": 9, "outer": 3}),
+            url,
+        )
+        self.assertEqual(
+            reverse("nested-converter-defaults", kwargs={"inner": 9}), url
+        )
+
     def test_reverse_invalid_query_failure_has_no_side_effect(self):
         cases = [0, False, [1, 3, 5], {1, 2, 3}, "string"]
         for query in cases:
