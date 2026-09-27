@@ -1,5 +1,5 @@
 from collections.abc import Iterable
-from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 
 from asgiref.local import Local
 
@@ -88,9 +88,12 @@ def _append_query_fragment(url, query=None, fragment=None):
     path returned by the URL resolver.
 
     The query string follows the path and the fragment always comes last.
-    Separators are never added for an absent value, an explicitly empty
-    fragment still terminates the URL with ``#``, and a query or fragment
-    already present in *url* is joined rather than given a second separator.
+    Separators are never added for an absent value: an empty query adds no
+    "?", and an explicitly empty fragment is a no-op that neither creates a
+    "#" nor clears a fragment already present in *url*. A non-empty fragment
+    is percent-encoded exactly once -- existing percent-escapes are kept --
+    and replaces any fragment already present, while a query or fragment
+    already in *url* is joined rather than given a second separator.
     """
     scheme, netloc, path, existing_query, existing_fragment = urlsplit(url)
     # urlsplit() represents a missing and an empty fragment identically, so
@@ -111,7 +114,6 @@ def _append_query_fragment(url, query=None, fragment=None):
             existing_query = (
                 f"{existing_query}&{query_string}" if existing_query else query_string
             )
-    fragment_is_empty = False
     if fragment is not None:
         # A plain str is accepted, as are lazy string proxies, which behave
         # exactly like str once evaluated. Everything else raises TypeError,
@@ -121,16 +123,19 @@ def _append_query_fragment(url, query=None, fragment=None):
                 "fragment must be a string, not %s" % type(fragment).__name__
             )
         fragment = str(fragment)
-        fragment_is_empty = not fragment
-        existing_fragment = fragment
+        if fragment:
+            # Encode exactly once: characters not allowed in a fragment are
+            # percent-encoded, while "%" is kept safe so existing escapes are
+            # not encoded again. Encoding any literal "#" guarantees the
+            # result carries a single "#" separator.
+            existing_fragment = quote(fragment, safe="!$&'()*+,;=:@/?%")
+        # An explicitly empty fragment is a no-op: it must not create a "#"
+        # where there is none, nor clear an existing fragment.
     url = urlunsplit((scheme, netloc, path, existing_query, existing_fragment))
-    # urlunsplit() drops an empty fragment, but an explicitly empty fragment
-    # -- either supplied by the caller or already present in the resolved URL
-    # when no replacement is given -- must still end the URL with "#".
-    fragment_is_empty = fragment_is_empty or (
-        fragment is None and fragment_present and not existing_fragment
-    )
-    if fragment_is_empty and not url.endswith("#"):
+    # urlunsplit() drops an empty fragment, but an empty fragment already
+    # present in the resolved URL -- and not replaced by a non-empty one --
+    # must still end the URL with "#".
+    if fragment_present and not existing_fragment and not url.endswith("#"):
         url += "#"
     return url
 

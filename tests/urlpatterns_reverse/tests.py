@@ -563,10 +563,15 @@ class URLPatternReverse(SimpleTestCase):
     def test_reverse_with_fragment(self):
         self.assertEqual(reverse("test", fragment="tab-1"), "/test/1#tab-1")
 
-    def test_reverse_with_fragment_not_encoded(self):
+    def test_reverse_with_fragment_encoded_once(self):
+        # Characters not allowed in a fragment are percent-encoded exactly
+        # once; sub-delims, "/", and "?" are kept, and existing
+        # percent-escapes are not encoded again.
         self.assertEqual(
-            reverse("test", fragment="tab 1 is the best!"), "/test/1#tab 1 is the best!"
+            reverse("test", fragment="tab 1 is the best!"),
+            "/test/1#tab%201%20is%20the%20best!",
         )
+        self.assertEqual(reverse("test", fragment="a%20b"), "/test/1#a%20b")
 
     def test_reverse_with_query_and_fragment(self):
         self.assertEqual(
@@ -576,7 +581,8 @@ class URLPatternReverse(SimpleTestCase):
 
     def test_reverse_with_empty_fragment(self):
         self.assertEqual(reverse("test", fragment=None), "/test/1")
-        self.assertEqual(reverse("test", fragment=""), "/test/1#")
+        # An explicitly empty fragment is a no-op: no "#" is created.
+        self.assertEqual(reverse("test", fragment=""), "/test/1")
 
     def test_reverse_with_invalid_fragment(self):
         cases = [0, False, {}, [], set(), ()]
@@ -763,12 +769,14 @@ class URLPatternReverse(SimpleTestCase):
         # The fragment always follows the query string.
         self.assertEqual(reverse("test", query={"a": 1}, fragment="f"), "/test/1?a=1#f")
 
-    def test_reverse_fragment_not_encoded_or_mixed_into_path(self):
-        fragment = "café #/?%s"
-        self.assertEqual(reverse("test", fragment=fragment), f"/test/1#{fragment}")
-        url = reverse("test", query={"a": "1"}, fragment=fragment)
-        self.assertTrue(url.startswith("/test/1?a=1#"))
-        self.assertEqual(url.removeprefix("/test/1?a=1#"), fragment)
+    def test_reverse_fragment_encoded_once_not_mixed_into_path(self):
+        # Non-ASCII, spaces, and a literal "#" are percent-encoded (so the
+        # URL keeps a single "#" separator); existing escapes stay intact.
+        self.assertEqual(
+            reverse("test", fragment="café #/?%s"), "/test/1#caf%C3%A9%20%23/?%s"
+        )
+        url = reverse("test", query={"a": "1"}, fragment="café #/?%s")
+        self.assertEqual(url, "/test/1?a=1#caf%C3%A9%20%23/?%s")
 
     def test_reverse_lazy_fragment(self):
         self.assertEqual(
@@ -780,8 +788,8 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(reverse("test", query=[]), "/test/1")
         self.assertEqual(reverse("test", query=QueryDict()), "/test/1")
         self.assertEqual(reverse("test"), "/test/1")
-        # An explicitly empty fragment keeps the "#".
-        self.assertEqual(reverse("test", fragment=""), "/test/1#")
+        # An explicitly empty fragment creates no "#".
+        self.assertEqual(reverse("test", fragment=""), "/test/1")
         # An empty query with a fragment adds no "?".
         self.assertEqual(reverse("test", query={}, fragment="f"), "/test/1#f")
 
@@ -803,6 +811,11 @@ class URLPatternReverse(SimpleTestCase):
         )
         # An existing empty fragment is preserved when only a query is added.
         self.assertEqual(_append_query_fragment("/p/x#", query={"a": 2}), "/p/x?a=2#")
+        # An explicitly empty fragment is a no-op: it neither creates a "#"
+        # nor clears an existing fragment.
+        self.assertEqual(_append_query_fragment("/p/x", fragment=""), "/p/x")
+        self.assertEqual(_append_query_fragment("/p/#frag", fragment=""), "/p/#frag")
+        self.assertEqual(_append_query_fragment("/p/x#", fragment=""), "/p/x#")
 
     def test_reverse_pattern_with_existing_query_string(self):
         # A "?" literal in the pattern is structural, not path content.
@@ -834,6 +847,8 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(
             reverse("existing-fragment", fragment="other"), "/weird3/#other"
         )
+        # An explicitly empty fragment leaves the existing one untouched.
+        self.assertEqual(reverse("existing-fragment", fragment=""), "/weird3/#frag")
 
     def test_reverse_pattern_with_existing_query_string_and_fragment(self):
         self.assertEqual(reverse("existing-query-fragment"), "/weird2/?x=1#frag")
@@ -859,6 +874,8 @@ class URLPatternReverse(SimpleTestCase):
         self.assertEqual(
             reverse("existing-empty-fragment", fragment="other"), "/weird5/#other"
         )
+        # An explicitly empty fragment preserves the bare "#".
+        self.assertEqual(reverse("existing-empty-fragment", fragment=""), "/weird5/#")
 
     def test_reverse_pattern_separators_not_double_encoded(self):
         # The structural "?" and "#" are not percent-encoded, and an encoded

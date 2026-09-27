@@ -83,16 +83,18 @@ mapping or sequence, or an empty ``QueryDict``) does not add a ``?``.
 
 The ``fragment`` keyword argument specifies a fragment identifier to be
 appended to the returned URL (that is, after the path and query string,
-preceded by a ``#``). It must be a string, which is appended verbatim without
-any percent-encoding; pass ``""`` to end the URL with a bare ``#``, or ``None``
-(the default) to omit the fragment entirely.
+preceded by a ``#``). It must be a string. A non-empty fragment is
+percent-encoded exactly once -- existing percent-escapes are preserved --
+and replaces any fragment the URL already carries. Passing ``""`` leaves
+the URL unchanged, and ``None`` (the default) omits the fragment entirely.
 
 If the URL pattern itself contains a literal ``?`` or ``#``, those characters
 are kept as structural separators in the returned URL rather than being
 percent-encoded into the path. A ``query`` is then merged into the existing
 query string (preserving the order of the existing keys, with a single ``?``
-separator), and a ``fragment`` replaces the existing fragment, which otherwise
-is preserved. The fragment always follows the entire query string.
+separator), and a non-empty ``fragment`` replaces the existing fragment, which
+otherwise is preserved (including by an explicitly empty ``fragment``). The
+fragment always follows the entire query string.
 
 For example:
 
@@ -105,8 +107,8 @@ For example:
    '/admin/?color=blue&color=1&none=None'
    >>> reverse("admin:index", query={"has empty spaces": "also has empty spaces!"})
    '/admin/?has+empty+spaces=also+has+empty+spaces%21'
-   >>> reverse("admin:index", fragment="no encoding is done")
-   '/admin/#no encoding is done'
+   >>> reverse("admin:index", fragment="encoding is done")
+   '/admin/#encoding%20is%20done'
 
 .. note::
 
