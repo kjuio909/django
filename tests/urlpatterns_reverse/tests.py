@@ -5,7 +5,9 @@ Unit tests for reverse URL lookups.
 import pickle
 import sys
 import threading
+import types
 from collections import OrderedDict
+from urllib.parse import unquote, urlsplit
 
 from admin_scripts.tests import AdminScriptTestCase
 
@@ -750,6 +752,124 @@ class URLPatternReverse(SimpleTestCase):
             reverse("test-ns1:urlobject-view", urlconf=urlconf, query=query),
             "/test1/inner/?a=1&a=2",
         )
+
+    def test_reverse_nested_converters_with_temporary_urlconf(self):
+        # Two or more levels of include(), with application namespaces,
+        # trailing slashes and path converters on both the include prefixes and
+        # the endpoint, combined with query/fragment arguments. Every include
+        # prefix is kept (without duplication), the full dotted name selects
+        # only that target, and the generated URL round-trips through the same
+        # URLconf with converter-typed keyword arguments.
+        module_name = "urlpatterns_reverse_temporary_nested_urls"
+        inner_patterns = [
+            path("detail/<int:pk>/", empty_view, name="detail"),
+            path("tree/<path:rest>/", empty_view, name="tree"),
+            path("tag/<slug:tag>/", empty_view, name="tag"),
+        ]
+        middle_patterns = [
+            path(
+                "articles/<int:year>/",
+                include((inner_patterns, "inner"), namespace="arts"),
+            ),
+            path(
+                "entries/<slug:blog>/",
+                include((inner_patterns, "inner"), namespace="ents"),
+            ),
+        ]
+        root_patterns = [
+            path("nested/", include((middle_patterns, "middle"), namespace="m1")),
+            path("other/", include((middle_patterns, "middle"), namespace="m2")),
+        ]
+        temp_module = types.ModuleType(module_name)
+        temp_module.urlpatterns = root_patterns
+        sys.modules[module_name] = temp_module
+        self.addCleanup(sys.modules.pop, module_name, None)
+        urlconf = module_name
+
+        # Include prefixes and converter values assemble in order, with no
+        # duplicated or dropped prefix, followed by a single query/fragment.
+        url = reverse(
+            "m1:arts:detail",
+            urlconf=urlconf,
+            kwargs={"year": 2020, "pk": 42},
+            query=[("page", 2)],
+            fragment="comments",
+        )
+        self.assertEqual(url, "/nested/articles/2020/detail/42/?page=2#comments")
+        # The same view mounted under a sibling instance namespace and a
+        # sibling branch resolves to that other target, never the first one.
+        sibling_url = reverse(
+            "m2:ents:detail",
+            urlconf=urlconf,
+            kwargs={"blog": "news", "pk": 7},
+        )
+        self.assertEqual(sibling_url, "/other/entries/news/detail/7/")
+
+        # A path converter value carrying slashes and reserved characters is
+        # percent-encoded exactly once in the path component, so the query and
+        # fragment stay structural and the path levels are not merged.
+        tree_url = reverse(
+            "m1:arts:tree",
+            urlconf=urlconf,
+            kwargs={"year": 2020, "rest": "a/b#c/100%done"},
+            query={"x": "1?2"},
+            fragment="f#1",
+        )
+        parts = urlsplit(tree_url)
+        self.assertEqual(parts.path, "/nested/articles/2020/tree/a/b%23c/100%25done/")
+        self.assertEqual(parts.query, "x=1%3F2")
+        self.assertEqual(parts.fragment, "f%231")
+        # The encoded path decodes back to the named view with the converter
+        # value restored; include prefixes are never captured as parameters.
+        match = resolve(unquote(parts.path), urlconf=urlconf)
+        self.assertEqual(match.view_name, "m1:arts:tree")
+        self.assertEqual(match.kwargs, {"year": 2020, "rest": "a/b#c/100%done"})
+
+        # Out-of-range / unconvertible values fail with NoReverseMatch and
+        # leave no partial path or state that perturbs a following call.
+        with self.assertRaises(NoReverseMatch):
+            reverse("m1:arts:detail", urlconf=urlconf, kwargs={"year": -1, "pk": 1})
+        with self.assertRaises(NoReverseMatch):
+            reverse(
+                "m1:arts:tag",
+                urlconf=urlconf,
+                kwargs={"year": 2020, "tag": "bad tag"},
+            )
+        # Repeated and alternating calls are byte-identical and independent of
+        # the previously resolved branch.
+        expected = [
+            (
+                reverse(
+                    "m1:arts:detail",
+                    urlconf=urlconf,
+                    kwargs={"year": i, "pk": i},
+                ),
+                reverse(
+                    "m2:ents:detail",
+                    urlconf=urlconf,
+                    kwargs={"blog": "b", "pk": i},
+                ),
+            )
+            for i in range(4)
+        ]
+        for _ in range(3):
+            for i, (one, two) in enumerate(expected):
+                self.assertEqual(
+                    reverse(
+                        "m1:arts:detail",
+                        urlconf=urlconf,
+                        kwargs={"year": i, "pk": i},
+                    ),
+                    one,
+                )
+                self.assertEqual(
+                    reverse(
+                        "m2:ents:detail",
+                        urlconf=urlconf,
+                        kwargs={"blog": "b", "pk": i},
+                    ),
+                    two,
+                )
 
     def test_reverse_with_query_set_value_order(self):
         # A set's values are expanded; their order matches set iteration.
