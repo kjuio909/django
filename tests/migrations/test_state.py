@@ -963,16 +963,15 @@ class StateTests(SimpleTestCase):
         with self.assertRaisesMessage(ValueError, msg):
             project_state.apps
 
-        # And another with ManyToManyField.
+        # And another with ManyToManyField. The intermediary model is built
+        # lazily once the related model is available, so a missing target only
+        # produces the one lazy-reference error on the field itself.
         project_state = ProjectState()
         project_state.add_model(ModelState.from_model(Magazine))
         msg = (
             "The field migrations.Magazine.authors was declared with a lazy reference "
             "to 'migrations.author', but app 'migrations' doesn't provide model "
-            "'author'.\n"
-            "The field migrations.Magazine_authors.author was declared with a lazy "
-            "reference to 'migrations.author', but app 'migrations' doesn't provide "
-            "model 'author'."
+            "'author'."
         )
         with self.assertRaisesMessage(ValueError, msg):
             project_state.apps
@@ -988,10 +987,7 @@ class StateTests(SimpleTestCase):
             "'publisher'.\n"
             "The field migrations.Magazine.authors was declared with a lazy reference "
             "to 'migrations.author', but app 'migrations' doesn't provide model "
-            "'author'.\n"
-            "The field migrations.Magazine_authors.author was declared with a lazy "
-            "reference to 'migrations.author', but app 'migrations' doesn't provide "
-            "model 'author'."
+            "'author'."
         )
         with self.assertRaisesMessage(ValueError, msg):
             project_state.apps

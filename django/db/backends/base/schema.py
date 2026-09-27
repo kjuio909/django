@@ -128,6 +128,10 @@ class BaseDatabaseSchemaEditor:
     )
     sql_create_inline_fk = None
     sql_create_column_inline_fk = None
+    # Table-level foreign key for relations spanning several columns (e.g. a
+    # relation to a composite primary key). Not supported inline by the
+    # default backend.
+    sql_create_table_composite_fk = None
     sql_delete_fk = sql_delete_constraint
 
     sql_create_index = (
@@ -275,6 +279,27 @@ class BaseDatabaseSchemaEditor:
                 )
                 if autoinc_sql:
                     self.deferred_sql.extend(autoinc_sql)
+        # Foreign keys spanning several columns, e.g. a relation to a
+        # composite primary key. They cannot be declared per column and are
+        # emitted as a table-level constraint. A multi-column relation that
+        # does not set ``db_constraint`` is a plain ForeignObject without
+        # database-level integrity.
+        for field in model._meta.local_fields:
+            related_fields = getattr(field, "related_fields", None)
+            if (
+                field.remote_field
+                and getattr(field, "db_constraint", False)
+                and related_fields is not None
+                and len(related_fields) > 1
+            ):
+                if self.sql_create_table_composite_fk:
+                    column_sqls.append(self._composite_inline_fk_sql(model, field))
+                elif self.connection.features.supports_foreign_keys:
+                    self.deferred_sql.append(
+                        self._create_fk_sql(
+                            model, field, "_fk_%(to_table)s_%(to_column)s"
+                        )
+                    )
         # The BaseConstraint DDL creation methods such as constraint_sql(),
         # create_sql(), and delete_sql(), were not designed in a way that
         # separate SQL from parameters which make their generated SQL unfit to
@@ -1788,11 +1813,13 @@ class BaseDatabaseSchemaEditor:
     def _create_fk_sql(self, model, field, suffix):
         table = Table(model._meta.db_table, self.quote_name)
         name = self._fk_constraint_name(model, field, suffix)
-        column = Columns(model._meta.db_table, [field.column], self.quote_name)
-        to_table = Table(field.target_field.model._meta.db_table, self.quote_name)
+        columns, to_columns = self._fk_columns(field)
+        column = Columns(model._meta.db_table, columns, self.quote_name)
+        to_table_model = self._fk_remote_model(field)
+        to_table = Table(to_table_model._meta.db_table, self.quote_name)
         to_column = Columns(
-            field.target_field.model._meta.db_table,
-            [field.target_field.column],
+            to_table_model._meta.db_table,
+            to_columns,
             self.quote_name,
         )
         deferrable = self.connection.ops.deferrable_sql()
@@ -1807,15 +1834,38 @@ class BaseDatabaseSchemaEditor:
             on_delete_db=self._create_on_delete_sql(model, field),
         )
 
+    def _fk_remote_model(self, field):
+        """Model targeted by the relation, even for multi-column relations."""
+        return field.remote_field.model
+
+    def _fk_columns(self, field):
+        """Return the local and referenced columns of a foreign key."""
+        local_columns = [local_field.column for local_field, _ in field.related_fields]
+        target_columns = [
+            target_field.column for _, target_field in field.related_fields
+        ]
+        return local_columns, target_columns
+
+    def _composite_inline_fk_sql(self, model, field):
+        columns, to_columns = self._fk_columns(field)
+        to_table = self._fk_remote_model(field)._meta.db_table
+        return self.sql_create_table_composite_fk % {
+            "column": ", ".join(self.quote_name(column) for column in columns),
+            "to_table": self.quote_name(to_table),
+            "to_column": ", ".join(self.quote_name(column) for column in to_columns),
+            "on_delete_db": self._create_on_delete_sql(model, field),
+        }
+
     def _fk_constraint_name(self, model, field, suffix):
         def create_fk_name(*args, **kwargs):
             return self.quote_name(self._create_index_name(*args, **kwargs))
 
+        local_columns, target_columns = self._fk_columns(field)
         return ForeignKeyName(
             model._meta.db_table,
-            [field.column],
-            split_identifier(field.target_field.model._meta.db_table)[1],
-            [field.target_field.column],
+            local_columns,
+            split_identifier(self._fk_remote_model(field)._meta.db_table)[1],
+            target_columns,
             suffix,
             create_fk_name,
         )

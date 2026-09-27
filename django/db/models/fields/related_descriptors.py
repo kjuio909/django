@@ -1107,6 +1107,14 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
             self.source_field = self.through._meta.get_field(self.source_field_name)
             self.target_field = self.through._meta.get_field(self.target_field_name)
 
+            # Number of columns of each end of the relation. A relation to a
+            # composite primary key spans several columns and keys must be
+            # represented as tuples for every lookup instead of scalars.
+            self.source_fields = self.source_field.local_related_fields
+            self.target_fields = self.target_field.local_related_fields
+            self.source_is_composite = len(self.source_fields) > 1
+            self.target_is_composite = len(self.target_fields) > 1
+
             self.core_filters = {}
             self.pk_field_names = {}
             for lh_field, rh_field in self.source_field.related_fields:
@@ -1116,10 +1124,23 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
 
             self.related_val = self.source_field.get_foreign_related_value(instance)
             if None in self.related_val:
+                if len(self.source_field.related_fields) == 1:
+                    raise ValueError(
+                        '"%r" needs to have a value for field "%s" before '
+                        "this many-to-many relationship can be used."
+                        % (
+                            instance,
+                            self.pk_field_names[self.source_field_name],
+                        )
+                    )
+                related_field_names = ", ".join(
+                    rh_field.name
+                    for _, rh_field in self.source_field.related_fields
+                )
                 raise ValueError(
-                    '"%r" needs to have a value for field "%s" before '
+                    '"%r" needs to have values for fields "%s" before '
                     "this many-to-many relationship can be used."
-                    % (instance, self.pk_field_names[self.source_field_name])
+                    % (instance, related_field_names)
                 )
             # Even if this relation is not to pk, we require still pk value.
             # The wish is that the instance has been already saved to DB,
@@ -1131,6 +1152,97 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                     % instance.__class__.__name__
                 )
 
+        def _key_from_values(self, values):
+            """Collapse a one-column key tuple to a scalar."""
+            return values[0] if len(values) == 1 else tuple(values)
+
+        def _source_filter_value(self):
+            """Value usable to filter the through model by the source side."""
+            return self._key_from_values(self.related_val)
+
+        def _target_key_from_instance(self, obj):
+            """Key of a related model instance (scalar or full tuple)."""
+            return self._key_from_values(
+                self.target_field.get_foreign_related_value(obj)
+            )
+
+        def _prepare_target_key(self, value):
+            """
+            Prepare a raw primary key (or full composite key tuple) pointing
+            at the target model. Each component is converted with its
+            corresponding field so that invalid values fail before any write.
+            """
+            foreign_fields = self.target_field.foreign_related_fields
+            if len(foreign_fields) == 1:
+                return foreign_fields[0].get_prep_value(value)
+            if not isinstance(value, (tuple, list)):
+                raise ValueError(
+                    "Field '%s' requires a tuple of %d elements."
+                    % (self.target_field_name, len(foreign_fields))
+                )
+            if len(value) != len(foreign_fields):
+                raise ValueError(
+                    "'%s' value must have %d elements, got %d."
+                    % (
+                        self.target_field_name,
+                        len(foreign_fields),
+                        len(value),
+                    )
+                )
+            prepared = tuple(
+                field.get_prep_value(component)
+                for field, component in zip(foreign_fields, value)
+            )
+            if any(component is None for component in prepared):
+                raise ValueError(
+                    'Cannot add "%r": the value for field "%s" contains None'
+                    % (value, self.target_field_name)
+                )
+            return prepared
+
+        def _coerce_target_key(self, obj):
+            """Turn an instance or raw pk into a prepared relation key."""
+            # Look the model class up on the base module rather than importing
+            # it from ``django.db.models``: the latter attribute may be a mock
+            # (e.g. in serializer tests), while the base module always exposes
+            # the real class.
+            import django.db.models.base as models_base
+
+            if isinstance(obj, self.model):
+                if not router.allow_relation(obj, self.instance):
+                    raise ValueError(
+                        'Cannot add "%r": instance is on database "%s", '
+                        'value is on database "%s"'
+                        % (obj, self.instance._state.db, obj._state.db)
+                    )
+                target_key = self._target_key_from_instance(obj)
+                values = (target_key,) if not self.target_is_composite else target_key
+                if any(value is None for value in values):
+                    raise ValueError(
+                        'Cannot add "%r": the value for field "%s" is None'
+                        % (obj, self.target_field_name)
+                    )
+                return target_key
+            if isinstance(obj, models_base.Model):
+                raise TypeError(
+                    "'%s' instance expected, got %r"
+                    % (self.model._meta.object_name, obj)
+                )
+            return self._prepare_target_key(obj)
+
+        def _through_relation_kwargs(self, link_field, key):
+            """
+            Assign all columns of a through model link field from a scalar or
+            full composite key.
+            """
+            values = (key,) if len(link_field.local_related_fields) == 1 else key
+            return {
+                local_field.attname: value
+                for local_field, value in zip(
+                    link_field.local_related_fields, values, strict=True
+                )
+            }
+
         def __call__(self, *, manager):
             manager = getattr(self.model, manager)
             manager_class = create_forward_many_to_many_manager(
@@ -1141,7 +1253,9 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
         do_not_call_in_templates = True
 
         def _build_remove_filters(self, removed_vals):
-            filters = Q.create([(self.source_field_name, self.related_val)])
+            filters = Q.create(
+                [(self.source_field_name, self._source_filter_value())]
+            )
             # No need to add a subquery condition if removed_vals is a QuerySet
             # without filters.
             removed_vals_filters = (
@@ -1151,7 +1265,7 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                 filters &= Q.create([(f"{self.target_field_name}__in", removed_vals)])
             if self.symmetrical:
                 symmetrical_filters = Q.create(
-                    [(self.target_field_name, self.related_val)]
+                    [(self.target_field_name, self._source_filter_value())]
                 )
                 if removed_vals_filters:
                     symmetrical_filters &= Q.create(
@@ -1263,14 +1377,14 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
             # If the through relation's target field's foreign integrity is
             # enforced, the query can be performed solely against the through
             # table as the INNER JOIN'ing against target table is unnecessary.
-            if not self.target_field.db_constraint:
+            if not getattr(self.target_field, "db_constraint", True):
                 return None
             db = router.db_for_read(self.through, instance=self.instance)
             if not connections[db].features.supports_foreign_keys:
                 return None
             hints = {"instance": self.instance}
             manager = self.through._base_manager.db_manager(db, hints=hints)
-            filters = {self.source_field_name: self.related_val[0]}
+            filters = {self.source_field_name: self._source_filter_value()}
             # Nullable target rows must be excluded as well as they would have
             # been filtered out from an INNER JOIN.
             if self.target_field.null:
@@ -1299,6 +1413,12 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
 
         def _add_base(self, *objs, through_defaults=None, using=None, raw=False):
             db = using or router.db_for_write(self.through, instance=self.instance)
+            # Validate inputs before opening the transaction so that bad key
+            # shapes, wrong types or unknown targets fail without marking the
+            # surrounding transaction for rollback.
+            if (self.source_is_composite or self.target_is_composite) and not raw:
+                target_ids = self._get_target_ids(objs)
+                self._check_targets_exist(db, target_ids)
             with transaction.atomic(using=db, savepoint=False):
                 self._add_items(
                     self.source_field_name,
@@ -1321,9 +1441,12 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                     )
 
         def add(self, *objs, through_defaults=None):
-            self._remove_prefetched_objects()
             db = router.db_for_write(self.through, instance=self.instance)
             self._add_base(*objs, through_defaults=through_defaults, using=db)
+            # Only drop a stale prefetched collection once the write
+            # succeeded so that failed operations keep exposing the old
+            # state.
+            self._remove_prefetched_objects()
 
         add.alters_data = True
 
@@ -1341,9 +1464,9 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
             )
 
         def remove(self, *objs):
-            self._remove_prefetched_objects()
             db = router.db_for_write(self.through, instance=self.instance)
             self._remove_base(*objs, using=db)
+            self._remove_prefetched_objects()
 
         remove.alters_data = True
 
@@ -1380,9 +1503,9 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                 )
 
         def clear(self):
-            self._remove_prefetched_objects()
             db = router.db_for_write(self.through, instance=self.instance)
             self._clear_base(using=db)
+            self._remove_prefetched_objects()
 
         clear.alters_data = True
 
@@ -1397,36 +1520,53 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
             objs = tuple(objs)
 
             db = router.db_for_write(self.through, instance=self.instance)
+
+            # Resolve and validate every target key before any write, so
+            # that an unknown key or bad component aborts without leaving a
+            # partially rewritten relation or a poisoned transaction.
+            new_target_keys = self._get_target_ids(objs)
+            if (self.source_is_composite or self.target_is_composite) and not raw:
+                self._check_targets_exist(db, new_target_keys)
+
             with transaction.atomic(using=db, savepoint=False):
-                self._remove_prefetched_objects()
                 if clear:
                     self._clear_base(using=db, raw=raw)
                     self._add_base(
                         *objs, through_defaults=through_defaults, using=db, raw=raw
                     )
                 else:
-                    old_ids = set(
-                        self.using(db).values_list(
-                            self.target_field.target_field.attname, flat=True
-                        )
+                    foreign_target_fields = self.target_field.foreign_related_fields
+                    current_field_name = (
+                        foreign_target_fields[0].attname
+                        if len(foreign_target_fields) == 1
+                        else self.model._meta.pk.name
+                    )
+                    old_keys = set(
+                        self.using(db).values_list(current_field_name, flat=True)
                     )
 
-                    new_objs = []
+                    add_keys = []
                     for obj in objs:
                         fk_val = (
-                            self.target_field.get_foreign_related_value(obj)[0]
+                            self._target_key_from_instance(obj)
                             if isinstance(obj, self.model)
-                            else self.target_field.get_prep_value(obj)
+                            else self._coerce_target_key(obj)
                         )
-                        if fk_val in old_ids:
-                            old_ids.remove(fk_val)
+                        if fk_val in old_keys:
+                            old_keys.remove(fk_val)
                         else:
-                            new_objs.append(obj)
+                            add_keys.append(fk_val)
 
-                    self._remove_base(*old_ids, using=db, raw=raw)
+                    self._remove_base(*old_keys, using=db, raw=raw)
                     self._add_base(
-                        *new_objs, through_defaults=through_defaults, using=db, raw=raw
+                        *add_keys,
+                        through_defaults=through_defaults,
+                        using=db,
+                        raw=raw,
                     )
+            # The relation was successfully rewritten; drop any stale
+            # prefetched collection.
+            self._remove_prefetched_objects()
 
         def set(self, objs, *, clear=False, through_defaults=None):
             self.set_base(objs, clear=clear, through_defaults=through_defaults)
@@ -1495,51 +1635,54 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
 
         aupdate_or_create.alters_data = True
 
-        def _get_target_ids(self, target_field_name, objs):
+        def _get_target_ids(self, objs):
             """
-            Return the set of ids of `objs` that the target field references.
+            Return the set of keys (scalars or full composite key tuples) of
+            ``objs``. Instances of another model, unsaved instances and
+            values whose components cannot be converted raise before any
+            write is attempted.
             """
-            from django.db.models import Model
+            return {self._coerce_target_key(obj) for obj in objs}
 
-            target_ids = set()
-            target_field = self.through._meta.get_field(target_field_name)
-            for obj in objs:
-                if isinstance(obj, self.model):
-                    if not router.allow_relation(obj, self.instance):
-                        raise ValueError(
-                            'Cannot add "%r": instance is on database "%s", '
-                            'value is on database "%s"'
-                            % (obj, self.instance._state.db, obj._state.db)
-                        )
-                    target_id = target_field.get_foreign_related_value(obj)[0]
-                    if target_id is None:
-                        raise ValueError(
-                            'Cannot add "%r": the value for field "%s" is None'
-                            % (obj, target_field_name)
-                        )
-                    target_ids.add(target_id)
-                elif isinstance(obj, Model):
-                    raise TypeError(
-                        "'%s' instance expected, got %r"
-                        % (self.model._meta.object_name, obj)
+        def _check_targets_exist(self, db, target_keys):
+            """
+            Ensure every full composite key refers to an existing target.
+            Matching is always performed on the complete key so that targets
+            sharing only one component are not mistaken for each other.
+            """
+            found_keys = set(
+                self.model._base_manager.using(db)
+                .filter(pk__in=list(target_keys))
+                .values_list("pk", flat=True)
+            )
+            missing_keys = target_keys.difference(found_keys)
+            if missing_keys:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist (missing keys: %s)."
+                    % (
+                        self.model._meta.object_name,
+                        sorted(repr(key) for key in missing_keys),
                     )
-                else:
-                    target_ids.add(target_field.get_prep_value(obj))
-            return target_ids
+                )
 
         def _get_missing_target_ids(
             self, source_field_name, target_field_name, db, target_ids
         ):
             """
-            Return the subset of ids of `objs` that aren't already assigned to
-            this relationship.
+            Return the subset of keys of `targets` that aren't already
+            assigned to this relationship. Comparison spans all columns of
+            both sides.
             """
+            source_field = self.through._meta.get_field(source_field_name)
+            source_key = self._key_from_values(
+                source_field.get_foreign_related_value(self.instance)
+            )
             vals = (
                 self.through._default_manager.using(db)
                 .values_list(target_field_name, flat=True)
                 .filter(
                     **{
-                        source_field_name: self.related_val[0],
+                        source_field_name: source_key,
                         "%s__in" % target_field_name: target_ids,
                     }
                 )
@@ -1596,22 +1739,33 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                 return
 
             through_defaults = dict(resolve_callables(through_defaults or {}))
-            target_ids = self._get_target_ids(target_field_name, objs)
+            target_ids = self._get_target_ids(objs)
             db = using or router.db_for_write(self.through, instance=self.instance)
+
+            # Existence is validated before entering the write transaction
+            # (in ``_add_base`` and ``set_base``), except for raw (fixture)
+            # loads which intentionally bypass that check.
             can_ignore_conflicts, must_send_signals, can_fast_add = self._get_add_plan(
                 db, source_field_name
             )
+            source_field = self.through._meta.get_field(source_field_name)
+            through_target_field = self.through._meta.get_field(target_field_name)
+            source_key = self._key_from_values(
+                source_field.get_foreign_related_value(self.instance)
+            )
+
+            def build_through_instance(target_id):
+                return self.through(
+                    **through_defaults,
+                    **self._through_relation_kwargs(source_field, source_key),
+                    **self._through_relation_kwargs(
+                        through_target_field, target_id
+                    ),
+                )
+
             if can_fast_add:
                 self.through._default_manager.using(db).bulk_create(
-                    [
-                        self.through(
-                            **{
-                                "%s_id" % source_field_name: self.related_val[0],
-                                "%s_id" % target_field_name: target_id,
-                            }
-                        )
-                        for target_id in target_ids
-                    ],
+                    [build_through_instance(tid) for tid in target_ids],
                     ignore_conflicts=True,
                 )
                 return
@@ -1634,14 +1788,8 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                 # Add the ones that aren't there already.
                 self.through._default_manager.using(db).bulk_create(
                     [
-                        self.through(
-                            **through_defaults,
-                            **{
-                                "%s_id" % source_field_name: self.related_val[0],
-                                "%s_id" % target_field_name: target_id,
-                            },
-                        )
-                        for target_id in missing_target_ids
+                        build_through_instance(tid)
+                        for tid in missing_target_ids
                     ],
                     ignore_conflicts=can_ignore_conflicts,
                 )
@@ -1668,14 +1816,11 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
             if not objs:
                 return
 
-            # Check that all the objects are of the right type
-            old_ids = set()
-            for obj in objs:
-                if isinstance(obj, self.model):
-                    fk_val = self.target_field.get_foreign_related_value(obj)[0]
-                    old_ids.add(fk_val)
-                else:
-                    old_ids.add(obj)
+            # Check that all the objects are of the right type and gather full
+            # keys; components of composite keys are converted before any
+            # signal or write so that a bad value aborts the operation
+            # untouched.
+            old_keys = self._get_target_ids(objs)
 
             db = using or router.db_for_write(self.through, instance=self.instance)
             with transaction.atomic(using=db, savepoint=False):
@@ -1686,17 +1831,23 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                     instance=self.instance,
                     reverse=self.reverse,
                     model=self.model,
-                    pk_set=old_ids,
+                    pk_set=old_keys,
                     using=db,
                     raw=raw,
                 )
                 target_model_qs = super().get_queryset()
                 if target_model_qs._has_filters():
+                    foreign_target_fields = self.target_field.foreign_related_fields
+                    target_field_name = (
+                        foreign_target_fields[0].attname
+                        if len(foreign_target_fields) == 1
+                        else self.model._meta.pk.name
+                    )
                     old_vals = target_model_qs.using(db).filter(
-                        **{"%s__in" % self.target_field.target_field.attname: old_ids}
+                        **{"%s__in" % target_field_name: old_keys}
                     )
                 else:
-                    old_vals = old_ids
+                    old_vals = old_keys
                 filters = self._build_remove_filters(old_vals)
                 self.through._default_manager.using(db).filter(filters).delete()
 
@@ -1706,7 +1857,7 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
                     instance=self.instance,
                     reverse=self.reverse,
                     model=self.model,
-                    pk_set=old_ids,
+                    pk_set=old_keys,
                     using=db,
                     raw=raw,
                 )

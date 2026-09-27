@@ -20,6 +20,10 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         "DEFERRED"
     )
     sql_create_column_inline_fk = sql_create_inline_fk
+    sql_create_table_composite_fk = (
+        "FOREIGN KEY (%(column)s) REFERENCES %(to_table)s (%(to_column)s)"
+        "%(on_delete_db)s DEFERRABLE INITIALLY DEFERRED"
+    )
     sql_create_unique = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)"
     sql_delete_unique = "DROP INDEX %(name)s"
     sql_alter_table_comment = None
@@ -113,6 +117,21 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         pk = model._meta.pk
         if isinstance(pk, CompositePrimaryKey):
             body[pk.name] = pk.clone()
+
+        # Column-less multi-column relations (e.g. a foreign key to a
+        # composite primary key) are not concrete either, but must still be
+        # present on the recreated model for their table-level constraint to
+        # be emitted.
+        for field in model._meta.local_fields:
+            related_fields = getattr(field, "related_fields", None)
+            if (
+                not field.concrete
+                and related_fields is not None
+                and len(related_fields) > 1
+            ):
+                # The field is deep-copied along with the rest of ``body``
+                # below, so sharing the instance is safe.
+                body[field.name] = field
 
         # Since mapping might mix column names and default values,
         # its values must be already quoted.

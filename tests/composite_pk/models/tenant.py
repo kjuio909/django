@@ -19,6 +19,10 @@ class AbstractUser(models.Model):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
     email = models.EmailField(unique=True)
     id = models.SmallIntegerField(unique=True)
+    tags = models.ManyToManyField("Tag", related_name="users")
+    friends = models.ManyToManyField("self")
+    posts = models.ManyToManyField("Post", related_name="authors")
+    labels = models.ManyToManyField("Label", related_name="users")
 
     class Meta:
         abstract = True
@@ -57,7 +61,7 @@ class Post(models.Model):
 
 class PostDbDefault(models.Model):
     pk = models.CompositePrimaryKey("tenant_id", "id")
-    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, default=1)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
     id = models.IntegerField(db_default=1)
 
 
@@ -66,3 +70,34 @@ class TimeStamped(models.Model):
     id = models.SmallIntegerField(unique=True)
     created = models.DateTimeField(auto_now_add=True)
     text = models.TextField(default="", blank=True)
+
+
+class Tag(models.Model):
+    name = models.CharField(max_length=50)
+
+
+class Label(models.Model):
+    pk = models.CompositePrimaryKey("tenant_id", "slug")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    slug = models.CharField(max_length=30)
+
+
+class Board(models.Model):
+    name = models.CharField(max_length=50)
+    members = models.ManyToManyField("Member", related_name="boards")
+
+
+class Member(models.Model):
+    """
+    Composite primary key whose second component is not globally unique:
+    objects may share one component and must still be distinguished.
+    """
+
+    pk = models.CompositePrimaryKey("tenant_id", "id")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    id = models.SmallIntegerField()
+    name = models.CharField(max_length=50, default="")
+    tags = models.ManyToManyField(Tag, related_name="tagged_members")
+    friends = models.ManyToManyField("self")
+    posts = models.ManyToManyField(Post, related_name="member_authors")
+    labels = models.ManyToManyField(Label, related_name="members")

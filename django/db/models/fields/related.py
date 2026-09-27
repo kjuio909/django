@@ -1409,6 +1409,151 @@ class OneToOneField(ForeignKey):
         return []
 
 
+def _intermediary_data_field_class_and_kwargs(model_field):
+    """
+    Return a concrete (non-relational) field class and deconstructed kwargs
+    suitable for storing one column of a foreign key to ``model_field``.
+
+    Composite primary keys may include regular fields and foreign keys (only
+    the latter's target column is stored), and auto-generated primary key
+    fields become plain value fields on the intermediary model.
+    """
+    from django.db import models
+
+    field = model_field
+    if field.is_relation:
+        if isinstance(field.remote_field.model, str):
+            # The field's relation may not have been rebound yet when the
+            # auto-created intermediary model is built (pending operations for
+            # the newly-registered endpoint run in insertion order). Resolve
+            # the referenced field directly through the app registry.
+            app_label, model_name = make_model_tuple(
+                resolve_relation(field.model, field.remote_field.model)
+            )
+            related_model = field.model._meta.apps.get_registered_model(
+                app_label, model_name
+            )
+            to_field_name = field.remote_field.field_name
+            if to_field_name is None:
+                to_field_name = related_model._meta.pk.name
+            field = related_model._meta.get_field(to_field_name)
+        else:
+            field = field.target_field
+
+    if isinstance(field, models.SmallAutoField):
+        field_class = models.SmallIntegerField
+    elif isinstance(field, models.BigAutoField):
+        field_class = models.BigIntegerField
+    elif isinstance(field, models.AutoField):
+        field_class = models.IntegerField
+    else:
+        field_class = field.__class__
+
+    _, _, _, kwargs = field.deconstruct()
+    # The intermediary columns are neither primary keys nor unique on their
+    # own; uniqueness is provided through ``unique_together``.
+    kwargs.pop("primary_key", None)
+    kwargs.pop("unique", None)
+    kwargs.pop("db_default", None)
+    for key in ("null", "blank"):
+        kwargs.setdefault(key, False)
+    return field_class, kwargs
+
+
+def _create_many_to_many_intermediary_link(field, model, link_name):
+    """
+    Build the parts of an automatically created many-to-many intermediary
+    model pointing at ``model`` and return a 3-tuple of:
+
+      - the relational field exposed on the intermediary model: a ForeignKey
+        for a regular primary key or a column-less ForeignObject spanning
+        all the columns of a composite primary key,
+      - the concrete data fields holding the foreign key columns, in the
+        order of the referenced primary key fields (``None`` for a regular
+        primary key, where the ForeignKey carries its own column),
+      - the names of the fields identifying a related object, used to expand
+        ``unique_together``.
+    """
+    from django.db import models
+    from django.db.models.fields.composite import CompositePrimaryKey
+
+    related_name = "%s+" % (
+        "%s_%s" % (field.model._meta.object_name, field.name)
+    )
+    common_kwargs = {
+        "related_name": related_name,
+        "db_tablespace": field.db_tablespace,
+        "on_delete": CASCADE,
+    }
+
+    pk = getattr(model, "_meta", None) and model._meta.pk
+    if isinstance(model, str) or not isinstance(pk, CompositePrimaryKey):
+        relation = models.ForeignKey(
+            model,
+            db_constraint=field.remote_field.db_constraint,
+            **common_kwargs,
+        )
+        return relation, None, (link_name,)
+
+    column_fields = []
+    column_names = []
+    for member in pk.fields:
+        field_class, field_kwargs = _intermediary_data_field_class_and_kwargs(member)
+        column_name = "%s_%s" % (link_name, member.column)
+        column_field = field_class(
+            db_column=column_name,
+            **field_kwargs,
+        )
+        column_field.set_attributes_from_name(column_name)
+        column_fields.append(column_field)
+        column_names.append(column_name)
+
+    relation = models.ForeignObject(
+        model,
+        from_fields=tuple(column_names),
+        to_fields=tuple(member.name for member in pk.fields),
+        **common_kwargs,
+    )
+    relation.db_constraint = field.remote_field.db_constraint
+    return relation, column_fields, tuple(column_names)
+
+
+def _resolve_auto_created_m2m_intermediary_model(klass_model, related_model, field):
+    from django.db.models.fields.composite import CompositePrimaryKey
+
+    # Building the intermediary model may require following foreign keys that
+    # are members of a composite primary key. Such targets are unrelated to
+    # the two ends of the m2m relation and may not have been registered yet;
+    # wait for them and retry.
+    pending_models = []
+    for endpoint in (klass_model, related_model):
+        pk = endpoint._meta.pk
+        if not isinstance(pk, CompositePrimaryKey):
+            continue
+        for member in pk.fields:
+            remote_field = getattr(member, "remote_field", None)
+            if remote_field is None or not isinstance(remote_field.model, str):
+                continue
+            resolved = resolve_relation(endpoint, remote_field.model)
+            app_label, model_name = make_model_tuple(resolved)
+            try:
+                endpoint._meta.apps.get_registered_model(app_label, model_name)
+            except LookupError:
+                pending_models.append(resolved)
+    if pending_models:
+        lazy_related_operation(
+            _resolve_auto_created_m2m_intermediary_model,
+            klass_model,
+            related_model,
+            *pending_models,
+            field=field,
+        )
+        return
+    field.remote_field.through = create_many_to_many_intermediary_model(
+        field, klass_model
+    )
+
+
 def create_many_to_many_intermediary_model(field, klass):
     from django.db import models
 
@@ -1425,6 +1570,29 @@ def create_many_to_many_intermediary_model(field, klass):
         to = "to_%s" % to
         from_ = "from_%s" % from_
 
+    from_link, from_columns, from_unique = _create_many_to_many_intermediary_link(
+        field, klass, from_
+    )
+    to_link, to_columns, to_unique = _create_many_to_many_intermediary_link(
+        field, to_model, to
+    )
+
+    body = {
+        "__module__": klass.__module__,
+        from_: from_link,
+        to: to_link,
+    }
+    for column_field in (*(from_columns or ()), *(to_columns or ())):
+        body[column_field.name] = column_field
+
+    # A regular ForeignKey gets an index implicitly; multi-column links to
+    # composite primary keys do not, so create the equivalent composite
+    # indexes explicitly.
+    indexes = []
+    for index_columns in (from_unique, to_unique):
+        if len(index_columns) > 1:
+            indexes.append(models.Index(fields=list(index_columns)))
+
     meta = type(
         "Meta",
         (),
@@ -1433,7 +1601,8 @@ def create_many_to_many_intermediary_model(field, klass):
             "auto_created": klass,
             "app_label": klass._meta.app_label,
             "db_tablespace": klass._meta.db_tablespace,
-            "unique_together": (from_, to),
+            "unique_together": (*from_unique, *to_unique),
+            "indexes": indexes,
             "verbose_name": _("%(from)s-%(to)s relationship")
             % {"from": from_, "to": to},
             "verbose_name_plural": _("%(from)s-%(to)s relationships")
@@ -1441,28 +1610,12 @@ def create_many_to_many_intermediary_model(field, klass):
             "apps": field.model._meta.apps,
         },
     )
+    body["Meta"] = meta
     # Construct and return the new class.
     return type(
         name,
         (models.Model,),
-        {
-            "Meta": meta,
-            "__module__": klass.__module__,
-            from_: models.ForeignKey(
-                klass,
-                related_name="%s+" % name,
-                db_tablespace=field.db_tablespace,
-                db_constraint=field.remote_field.db_constraint,
-                on_delete=CASCADE,
-            ),
-            to: models.ForeignKey(
-                to_model,
-                related_name="%s+" % name,
-                db_tablespace=field.db_tablespace,
-                db_constraint=field.remote_field.db_constraint,
-                on_delete=CASCADE,
-            ),
-        },
+        body,
     )
 
 
@@ -1607,7 +1760,11 @@ class ManyToManyField(RelatedField):
         return warnings
 
     def _check_relationship_model(self, from_model=None, **kwargs):
-        from django.db.models.fields.composite import CompositePrimaryKey
+        # The intermediary model is created lazily once the related model is
+        # loaded. If it cannot be loaded, super().check() already reports
+        # fields.E300.
+        if self.remote_field.through is None:
+            return []
 
         if hasattr(self.remote_field.through, "_meta"):
             qualified_model_name = "%s.%s" % (
@@ -1645,24 +1802,6 @@ class ManyToManyField(RelatedField):
                 to_model_name = to_model
             else:
                 to_model_name = to_model._meta.object_name
-            if self.remote_field.through_fields is None and not isinstance(
-                to_model, str
-            ):
-                model_name = None
-                if isinstance(to_model._meta.pk, CompositePrimaryKey):
-                    model_name = self.remote_field.model._meta.object_name
-                elif isinstance(from_model._meta.pk, CompositePrimaryKey):
-                    model_name = from_model_name
-                if model_name:
-                    errors.append(
-                        checks.Error(
-                            f"Field defines a relation involving model {model_name!r} "
-                            "which has a CompositePrimaryKey and such relations are "
-                            "not supported.",
-                            obj=self,
-                            id="fields.E347",
-                        )
-                    )
             relationship_model_name = self.remote_field.through._meta.object_name
             self_referential = from_model == to_model
             # Count foreign keys in intermediate model
@@ -1863,7 +2002,8 @@ class ManyToManyField(RelatedField):
 
     def _check_table_uniqueness(self, **kwargs):
         if (
-            isinstance(self.remote_field.through, str)
+            self.remote_field.through is None
+            or isinstance(self.remote_field.through, str)
             or not self.remote_field.through._meta.managed
         ):
             return []
@@ -1916,7 +2056,8 @@ class ManyToManyField(RelatedField):
     def _check_on_delete(self, **kwargs):
         errors = []
         if (
-            isinstance(self.remote_field.through, str)
+            self.remote_field.through is None
+            or isinstance(self.remote_field.through, str)
             or not self.remote_field.through._meta.auto_created
         ):
             # Manually created through models are checked on their own.
@@ -2151,9 +2292,34 @@ class ManyToManyField(RelatedField):
                     resolve_through_model, cls, self.remote_field.through, field=self
                 )
             elif not cls._meta.swapped:
-                self.remote_field.through = create_many_to_many_intermediary_model(
-                    self, cls
-                )
+                to_model = resolve_relation(cls, self.remote_field.model)
+                if isinstance(to_model, str):
+                    # The related model is referenced by a string and may turn
+                    # out to have a composite primary key. Defer building the
+                    # intermediary model until it is loaded so the relation
+                    # can span all of its columns.
+                    lazy_related_operation(
+                        _resolve_auto_created_m2m_intermediary_model,
+                        cls,
+                        self.remote_field.model,
+                        field=self,
+                    )
+                else:
+                    # Create eagerly so migration states and system checks
+                    # can inspect the intermediary model. If a composite
+                    # primary key member points at an unregistered model the
+                    # creation is retried lazily.
+                    try:
+                        self.remote_field.through = (
+                            create_many_to_many_intermediary_model(self, cls)
+                        )
+                    except LookupError:
+                        lazy_related_operation(
+                            _resolve_auto_created_m2m_intermediary_model,
+                            cls,
+                            self.remote_field.model,
+                            field=self,
+                        )
 
         # Add the descriptor for the m2m relation.
         setattr(cls, self.name, ManyToManyDescriptor(self.remote_field, reverse=False))

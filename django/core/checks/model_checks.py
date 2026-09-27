@@ -200,6 +200,10 @@ def _check_lazy_references(apps, ignore=None):
     # default_error() will be used for usages that don't appear in this dict.
     known_lazy = {
         ("django.db.models.fields.related", "resolve_related_class"): field_error,
+        (
+            "django.db.models.fields.related",
+            "_resolve_auto_created_m2m_intermediary_model",
+        ): field_error,
         ("django.db.models.fields.related", "set_managed"): None,
         ("django.dispatch.dispatcher", "connect"): signal_connect_error,
     }

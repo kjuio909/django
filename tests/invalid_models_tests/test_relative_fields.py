@@ -484,20 +484,10 @@ class RelativeFieldTests(SimpleTestCase):
                 "Parent", related_name="child_string_set"
             )
 
-        error = (
-            "Field defines a relation involving model 'Parent' which has a "
-            "CompositePrimaryKey and such relations are not supported."
-        )
         field = Child._meta.get_field("rel_string_parent")
-        self.assertEqual(
-            field.check(from_model=Child),
-            [Error(error, obj=field, id="fields.E347")],
-        )
+        self.assertEqual(field.check(from_model=Child), [])
         field = Child._meta.get_field("rel_class_parent")
-        self.assertEqual(
-            field.check(from_model=Child),
-            [Error(error, obj=field, id="fields.E347")],
-        )
+        self.assertEqual(field.check(from_model=Child), [])
 
     def test_many_to_many_from_model_with_composite_primary_key(self):
         class Parent(models.Model):
@@ -515,15 +505,8 @@ class RelativeFieldTests(SimpleTestCase):
             class Meta:
                 app_label = "invalid_models_tests"
 
-        error = (
-            "Field defines a relation involving model 'Child' which has a "
-            "CompositePrimaryKey and such relations are not supported."
-        )
         field = Child._meta.get_field("parents")
-        self.assertEqual(
-            field.check(from_model=Child),
-            [Error(error, obj=field, id="fields.E347")],
-        )
+        self.assertEqual(field.check(from_model=Child), [])
 
     def test_foreign_key_to_non_unique_field(self):
         class Target(models.Model):
