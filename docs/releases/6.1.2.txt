@@ -1,0 +1,24 @@
+==========================
+Django 6.1.2 release notes
+==========================
+
+*Not yet released*
+
+Django 6.1.2 fixes several bugs in 6.1.1.
+
+Bugfixes
+========
+
+* Allowed a :class:`~django.db.models.ForeignObject` spanning the full set of
+  fields of a related model's
+  :class:`~django.db.models.CompositePrimaryKey` to be used with the
+  relation, including forward and reverse access, filtering, ordering,
+  ``select_related()``, ``prefetch_related()``, and deleting the target
+  without cascading.
+
+* Fixed a crash when generating and applying migrations for a model with a
+  :class:`~django.db.models.CompositePrimaryKey` that was referenced by a
+  :class:`~django.db.models.ForeignObject` or a
+  :class:`~django.db.models.ManyToManyField`; a foreign key that is itself a
+  member of the composite primary key is now kept on the ``CreateModel``
+  operation instead of being split into a later ``AddField``.

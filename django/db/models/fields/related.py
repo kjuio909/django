@@ -1541,12 +1541,21 @@ def _resolve_auto_created_m2m_intermediary_model(klass_model, related_model, fie
             except LookupError:
                 pending_models.append(resolved)
     if pending_models:
+        # lazy_related_operation() passes the resolved endpoint and pending
+        # models back as positional arguments, but building the intermediary
+        # only depends on the field and its defining model captured here.
+        def resolve_when_ready(
+            *resolved_models, field=field, klass_model=klass_model
+        ):
+            field.remote_field.through = create_many_to_many_intermediary_model(
+                field, klass_model
+            )
+
         lazy_related_operation(
-            _resolve_auto_created_m2m_intermediary_model,
+            resolve_when_ready,
             klass_model,
             related_model,
             *pending_models,
-            field=field,
         )
         return
     field.remote_field.through = create_many_to_many_intermediary_model(

@@ -128,3 +128,41 @@ class Bookmark(models.Model):
 
     name = models.CharField(max_length=50)
     tags = models.ManyToManyField(Tag, related_name="bookmarks")
+
+
+class MemberBooking(models.Model):
+    """
+    Source pointing at Member's full composite primary key
+    (tenant_id, id) through a ForeignObject.
+    """
+
+    tenant_id = models.SmallIntegerField()
+    member_id = models.SmallIntegerField(null=True)
+    member = models.ForeignObject(
+        Member,
+        on_delete=models.DO_NOTHING,
+        from_fields=("tenant_id", "member_id"),
+        to_fields=("tenant_id", "id"),
+        related_name="bookings",
+        null=True,
+    )
+    note = models.CharField(max_length=50, default="")
+
+
+class BookHold(models.Model):
+    """
+    Source pointing at Book's full composite primary key
+    (tenant_id, isbn) through a ForeignObject.
+    """
+
+    tenant_id = models.SmallIntegerField()
+    isbn = models.CharField(max_length=30, null=True)
+    book = models.ForeignObject(
+        Book,
+        on_delete=models.DO_NOTHING,
+        from_fields=("tenant_id", "isbn"),
+        to_fields=("tenant_id", "isbn"),
+        related_name="holds",
+        null=True,
+    )
+    note = models.CharField(max_length=50, default="")

@@ -6940,6 +6940,79 @@ class OperationTests(OperationTestBase):
         self.assertEqual(obj_2.id, 2)
         self.assertEqual(obj_2.pk, obj_2.id)
 
+    def test_create_composite_pk_model_with_inline_member_fk(self):
+        # The autodetector keeps foreign keys that are members of a composite
+        # primary key on the CreateModel operation. Applying that operation
+        # must render the model and create its table without the composite
+        # key failing to resolve its members.
+        app_label = "test_cpkmemberfk"
+        operation_author = migrations.CreateModel(
+            "Author",
+            [
+                ("id", models.AutoField(primary_key=True)),
+            ],
+        )
+        operation_tag = migrations.CreateModel(
+            "Tag",
+            [
+                ("id", models.AutoField(primary_key=True)),
+                ("name", models.CharField(max_length=20)),
+            ],
+        )
+        operation_book = migrations.CreateModel(
+            "Book",
+            [
+                (
+                    "pk",
+                    models.CompositePrimaryKey("author_id", "isbn"),
+                ),
+                (
+                    "author",
+                    models.ForeignKey(f"{app_label}.Author", models.CASCADE),
+                ),
+                ("isbn", models.CharField(max_length=20)),
+                (
+                    "tags",
+                    models.ManyToManyField(f"{app_label}.Tag", related_name="books"),
+                ),
+            ],
+        )
+        operation_review = migrations.CreateModel(
+            "Review",
+            [
+                ("id", models.AutoField(primary_key=True)),
+                ("author_id", models.IntegerField()),
+                ("isbn", models.CharField(max_length=20, null=True)),
+                (
+                    "book",
+                    models.ForeignObject(
+                        f"{app_label}.Book",
+                        on_delete=models.DO_NOTHING,
+                        from_fields=("author_id", "isbn"),
+                        to_fields=("author_id", "isbn"),
+                        null=True,
+                    ),
+                ),
+            ],
+        )
+        project_state = ProjectState()
+        new_state = self.apply_operations(
+            app_label,
+            project_state,
+            [operation_author, operation_tag, operation_book, operation_review],
+        )
+        Author = new_state.apps.get_model(app_label, "Author")
+        Book = new_state.apps.get_model(app_label, "Book")
+        Review = new_state.apps.get_model(app_label, "Review")
+        Tag = new_state.apps.get_model(app_label, "Tag")
+        author = Author.objects.create()
+        tag = Tag.objects.create(name="t")
+        book = Book.objects.create(author=author, isbn="123")
+        book.tags.add(tag)
+        self.assertEqual(list(book.tags.all()), [tag])
+        review = Review.objects.create(author_id=author.pk, book=book)
+        self.assertEqual(Review.objects.get(pk=review.pk).book, book)
+
 
 class SwappableOperationTests(OperationTestBase):
     """

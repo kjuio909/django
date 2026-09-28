@@ -5590,6 +5590,124 @@ class AutodetectorTests(BaseAutodetectorTests):
             preserve_default=True,
         )
 
+    def test_create_composite_pk_model_with_incoming_foreign_object(self):
+        # A ForeignObject pointing at a model with a composite primary key
+        # creates a dependency cycle. The foreign key that is itself a member
+        # of the composite key must remain on CreateModel, otherwise the
+        # composite key cannot resolve its members while the model renders.
+        author = ModelState(
+            "app",
+            "Author",
+            [
+                ("id", models.AutoField(primary_key=True)),
+                ("name", models.CharField(max_length=20)),
+            ],
+        )
+        book = ModelState(
+            "app",
+            "Book",
+            [
+                (
+                    "pk",
+                    models.CompositePrimaryKey("author_id", "isbn"),
+                ),
+                (
+                    "author",
+                    models.ForeignKey("app.Author", models.CASCADE),
+                ),
+                ("isbn", models.CharField(max_length=20)),
+            ],
+        )
+        review = ModelState(
+            "app",
+            "Review",
+            [
+                ("id", models.AutoField(primary_key=True)),
+                ("author_id", models.IntegerField()),
+                ("isbn", models.CharField(max_length=20, null=True)),
+                (
+                    "book",
+                    models.ForeignObject(
+                        "app.Book",
+                        on_delete=models.DO_NOTHING,
+                        from_fields=("author_id", "isbn"),
+                        to_fields=("author_id", "isbn"),
+                        null=True,
+                    ),
+                ),
+            ],
+        )
+        changes = self.get_changes([], [author, book, review])
+        self.assertNumberMigrations(changes, "app", 1)
+        self.assertOperationTypes(
+            changes,
+            "app",
+            0,
+            ["CreateModel", "CreateModel", "CreateModel"],
+        )
+        operations = changes["app"][0].operations
+        book_operation = next(
+            operation for operation in operations if operation.name == "Book"
+        )
+        field_names = [name for name, field in book_operation.fields]
+        # The composite key and its foreign key member stay together on the
+        # CreateModel rather than being split into a later AddField.
+        self.assertIn("pk", field_names)
+        self.assertIn("author", field_names)
+
+    def test_create_composite_pk_model_referenced_by_m2m(self):
+        # A many-to-many relation to a model with a composite primary key
+        # introduces a dependency cycle through the implicit intermediary
+        # model. As with an incoming ForeignObject, the foreign key member of
+        # the composite key must remain on CreateModel.
+        author = ModelState(
+            "app",
+            "Author",
+            [
+                ("id", models.AutoField(primary_key=True)),
+                ("name", models.CharField(max_length=20)),
+            ],
+        )
+        tag = ModelState(
+            "app",
+            "Tag",
+            [
+                ("id", models.AutoField(primary_key=True)),
+                ("name", models.CharField(max_length=20)),
+            ],
+        )
+        book = ModelState(
+            "app",
+            "Book",
+            [
+                (
+                    "pk",
+                    models.CompositePrimaryKey("author_id", "isbn"),
+                ),
+                (
+                    "author",
+                    models.ForeignKey("app.Author", models.CASCADE),
+                ),
+                ("isbn", models.CharField(max_length=20)),
+                (
+                    "tags",
+                    models.ManyToManyField("app.Tag", related_name="books"),
+                ),
+            ],
+        )
+        changes = self.get_changes([], [author, tag, book])
+        self.assertNumberMigrations(changes, "app", 1)
+        operations = changes["app"][0].operations
+        book_operation = next(
+            operation
+            for operation in operations
+            if type(operation).__name__ == "CreateModel"
+            and operation.name == "Book"
+        )
+        field_names = [name for name, field in book_operation.fields]
+        self.assertIn("pk", field_names)
+        self.assertIn("author", field_names)
+
     def test_does_not_crash_after_rename_on_unique_together(self):
         fields = ("first", "second")
         before = self.make_project_state(

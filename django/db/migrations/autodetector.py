@@ -678,6 +678,35 @@ class MigrationAutodetector:
                     if getattr(field.remote_field, "through", None):
                         related_fields[field_name] = field
 
+            # Fields that are members of a composite primary key must stay on
+            # the CreateModel operation. The CompositePrimaryKey resolves its
+            # members as soon as the model is rendered (including while its
+            # table is created), so deferring such a field to AddField would
+            # leave the composite key pointing at a field that does not exist
+            # yet. Their external dependencies are attached to CreateModel
+            # below instead of to AddField operations.
+            composite_pk = next(
+                (
+                    field
+                    for field in model_state.fields.values()
+                    if isinstance(field, models.CompositePrimaryKey)
+                ),
+                None,
+            )
+            inline_related_fields = {}
+            if composite_pk is not None:
+                composite_pk_members = set(composite_pk.field_names)
+                for field_name in list(related_fields):
+                    # In migration state fields are not bound to a model, so
+                    # field.name/attname are not set yet; use the field's name
+                    # in the model state and its attname candidate instead
+                    # (a ForeignKey named "tenant" has attname "tenant_id").
+                    candidate_names = {field_name, f"{field_name}_id"}
+                    if candidate_names & composite_pk_members:
+                        inline_related_fields[field_name] = related_fields.pop(
+                            field_name
+                        )
+
             # Are there indexes/unique_together to defer?
             indexes = model_state.options.pop("indexes")
             constraints = model_state.options.pop("constraints")
@@ -736,6 +765,18 @@ class MigrationAutodetector:
                         None,
                         OperationDependency.Type.CREATE,
                     ),
+                )
+            # Related fields kept inline because they are members of a composite
+            # primary key still need their external targets ordered before
+            # this model.
+            for field in inline_related_fields.values():
+                dependencies.extend(
+                    self._get_dependencies_for_foreign_key(
+                        app_label,
+                        model_name,
+                        field,
+                        self.to_state,
+                    )
                 )
             # Generate creation operation
             self.add_operation(
