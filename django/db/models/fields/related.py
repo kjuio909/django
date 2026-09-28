@@ -657,6 +657,12 @@ class ForeignObject(RelatedField):
         if isinstance(self.remote_field.model, str):
             return []
 
+        # Links inside an automatically created many-to-many intermediary
+        # model support composite primary keys on both sides; the usual
+        # ForeignKey restriction doesn't apply to them.
+        if self.model._meta.auto_created:
+            return []
+
         errors = []
         for to_field in self.to_fields:
             try:

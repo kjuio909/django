@@ -1572,12 +1572,20 @@ class ModelChoiceField(ChoiceField):
 
     choices = property(_get_choices, ChoiceField.choices.fset)
 
+    @property
+    def _is_composite_pk(self):
+        return self.to_field_name is None and self.queryset.model._meta.is_composite_pk
+
     def prepare_value(self, value):
         if hasattr(value, "_meta"):
             if self.to_field_name:
                 return value.serializable_value(self.to_field_name)
+            elif self._is_composite_pk:
+                return value._meta.pk.encode_pk(value.pk)
             else:
                 return value.pk
+        if self._is_composite_pk and isinstance(value, (list, tuple)):
+            return self.queryset.model._meta.pk.encode_pk(value)
         return super().prepare_value(value)
 
     def to_python(self, value):
@@ -1588,7 +1596,11 @@ class ModelChoiceField(ChoiceField):
             key = self.to_field_name or "pk"
             if isinstance(value, self.queryset.model):
                 value = getattr(value, key)
-            value = self.queryset.get(**{key: value})
+            if self._is_composite_pk:
+                pk = self.queryset.model._meta.pk.decode_pk(value)
+                value = self.queryset.get(**{key: pk})
+            else:
+                value = self.queryset.get(**{key: value})
         except (
             ValueError,
             TypeError,
@@ -1668,6 +1680,35 @@ class ModelMultipleChoiceField(ModelChoiceField):
                 self.error_messages["invalid_list"],
                 code="invalid_list",
             )
+        if self._is_composite_pk:
+            # Each submitted value is an encoded composite primary key. Decode
+            # every part before touching the database: a malformed value, a
+            # wrong number of parts, or a component that can't be converted
+            # must fail validation before anything is saved.
+            pk_field = self.queryset.model._meta.pk
+            decoded_values = {}
+            for pk in value:
+                self.validate_no_null_characters(pk)
+                try:
+                    decoded = pk_field.decode_pk(pk)
+                except (ValueError, TypeError, ValidationError):
+                    raise ValidationError(
+                        self.error_messages["invalid_choice"],
+                        code="invalid_choice",
+                        params={"value": pk},
+                    )
+                decoded_values[pk] = decoded
+            values = list(decoded_values.values())
+            qs = self.queryset.filter(**{"%s__in" % key: values})
+            pks = {obj.pk for obj in qs}
+            for val, decoded in decoded_values.items():
+                if decoded not in pks:
+                    raise ValidationError(
+                        self.error_messages["invalid_choice"],
+                        code="invalid_choice",
+                        params={"value": val},
+                    )
+            return qs
         for pk in value:
             self.validate_no_null_characters(pk)
             try:
