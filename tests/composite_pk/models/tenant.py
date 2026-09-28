@@ -128,3 +128,34 @@ class Bookmark(models.Model):
 
     name = models.CharField(max_length=50)
     tags = models.ManyToManyField(Tag, related_name="bookmarks")
+
+
+class Venue(models.Model):
+    """
+    Target with a two-field composite primary key whose first component is
+    shared between distinct objects, e.g. (1, 'a') and (2, 'a') / (1, 'b').
+    """
+
+    pk = models.CompositePrimaryKey("tenant_id", "code")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    code = models.CharField(max_length=20)
+    name = models.CharField(max_length=50, default="")
+
+
+class Reservation(models.Model):
+    """
+    A persistable ForeignObject relation spanning the composite primary key
+    of Venue with no database-level foreign key, so deleting a venue never
+    cascades to its reservations.
+    """
+
+    venue_tenant_id = models.SmallIntegerField(null=True)
+    venue_code = models.CharField(max_length=20, null=True)
+    venue = models.ForeignObject(
+        Venue,
+        on_delete=models.DO_NOTHING,
+        from_fields=("venue_tenant_id", "venue_code"),
+        to_fields=("tenant_id", "code"),
+        related_name="reservations",
+        null=True,
+    )

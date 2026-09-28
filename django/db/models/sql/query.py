@@ -2216,6 +2216,14 @@ class Query(BaseExpression):
             cur_targets = {t.column for t in targets}
             if not cur_targets.issubset(join_targets):
                 break
+            # A multi-column relation (e.g. a ForeignObject spanning a
+            # composite primary key) can only be trimmed when the lookup
+            # covers every joined column. Trimming a single component away
+            # to its local column would drop the join that verifies the
+            # whole key matches a target, so rows sharing that component
+            # but pointing at another (or no) target would leak through.
+            if len(join_targets) > 1 and cur_targets != join_targets:
+                break
             targets_dict = {
                 r[1].column: r[0]
                 for r in info.join_field.related_fields

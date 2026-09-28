@@ -7,12 +7,14 @@ from .tenant import (
     Member,
     Post,
     PostDbDefault,
+    Reservation,
     Shelf,
     Tag,
     Tenant,
     TimeStamped,
     Token,
     User,
+    Venue,
 )
 
 __all__ = [
@@ -24,10 +26,12 @@ __all__ = [
     "Member",
     "Post",
     "PostDbDefault",
+    "Reservation",
     "Shelf",
     "Tag",
     "Tenant",
     "TimeStamped",
     "Token",
     "User",
+    "Venue",
 ]
