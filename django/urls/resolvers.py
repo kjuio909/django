@@ -967,9 +967,17 @@ class URLResolver:
         else:
             return self.urlconf_name
 
-    @cached_property
+    @property
     def url_patterns(self):
-        # urlconf_module might be a valid set of patterns, so we default to it
+        # Read the patterns from the URLconf module on every access instead
+        # of caching them. A URLconf object handed in by the caller (an object
+        # exposing ``urlpatterns``) may have that attribute replaced at
+        # runtime; the resolver cached for the object must then resolve
+        # against the new table immediately, without the caller having to
+        # clear any internal cache. Reading live also means a table that
+        # fails to resolve leaves no stale snapshot behind, so a corrected
+        # table takes effect on the next call.
+        # urlconf_module might be a valid set of patterns, so default to it.
         patterns = getattr(self.urlconf_module, "urlpatterns", self.urlconf_module)
         try:
             iter(patterns)

@@ -28,7 +28,7 @@ from .converters import (
     NoneReturningConverter,
     RejectingConverter,
 )
-from .views import empty_view
+from .views import empty_view, new_view, old_view
 
 included_kwargs = {"base": b"hello", "value": b"world"}
 converter_test_data = (
@@ -795,6 +795,206 @@ class TemporaryURLConfResolveTests(SimpleTestCase):
             resolve("/fr/loc/b/article/5/", urlconf)
         after = resolve("/plain/5/", urlconf)
         self.assertEqual(self._snapshot(before), self._snapshot(after))
+
+
+class _MutableURLconf:
+    """A hashable URLconf object whose ``urlpatterns`` can be replaced."""
+
+    def __init__(self, urlpatterns):
+        self.urlpatterns = urlpatterns
+
+
+class URLConfReloadResolveTests(SimpleTestCase):
+    """
+    Replacing the urlpatterns attribute of a URLconf object already resolved
+    against must take effect on the next resolve() call, without the caller
+    clearing any resolver cache. Each call is interpreted solely against the
+    current table.
+    """
+
+    def _snapshot(self, match):
+        return (
+            match.func,
+            match.args,
+            tuple(match.kwargs.items()),
+            match.url_name,
+            tuple(match.app_names),
+            tuple(match.namespaces),
+            match.route,
+            tuple(match.captured_kwargs.items()),
+            tuple(sorted(match.extra_kwargs.items())),
+        )
+
+    def test_replacement_takes_effect_immediately(self):
+        urlconf = _MutableURLconf(
+            [path("old/<int:pk>/", old_view, name="old")]
+        )
+        match = resolve("/old/42/", urlconf)
+        self.assertIs(match.func, old_view)
+        self.assertEqual(match.kwargs, {"pk": 42})
+        self.assertEqual(match.namespaces, [])
+
+        # Replace the routing table on the very same object.
+        urlconf.urlpatterns = [
+            path("new/<int:id>/", new_view, name="new"),
+        ]
+
+        match = resolve("/new/7/", urlconf)
+        self.assertIs(match.func, new_view)
+        self.assertEqual(match.url_name, "new")
+        self.assertEqual(match.kwargs, {"id": 7})
+        self.assertIsInstance(match.kwargs["id"], int)
+        self.assertEqual(match.namespaces, [])
+        with self.assertRaises(Resolver404):
+            resolve("/old/42/", urlconf)
+
+    def test_replacement_with_nested_includes_and_namespaces(self):
+        urlconf = _MutableURLconf(
+            [path("old/", old_view, name="old")]
+        )
+        self.assertIs(resolve("/old/", urlconf).func, old_view)
+
+        inner = (
+            [path("page/<int:num>/", new_view, name="page")],
+            "innerapp",
+        )
+        middle = (
+            [path("mid/<slug:section>/", include(inner))],
+            "midapp",
+        )
+        urlconf.urlpatterns = [
+            path("root/", include(middle, namespace="midns")),
+        ]
+
+        match = resolve("/root/mid/news/page/3/", urlconf)
+        self.assertIs(match.func, new_view)
+        # The include() prefixes appear exactly once, in order, and neither
+        # captured parameter leaks into the other level's namespace.
+        self.assertEqual(match.route, "root/mid/<slug:section>/page/<int:num>/")
+        self.assertEqual(match.app_names, ["midapp", "innerapp"])
+        self.assertEqual(match.namespaces, ["midns", "innerapp"])
+        self.assertEqual(match.kwargs, {"section": "news", "num": 3})
+        self.assertIsInstance(match.kwargs["num"], int)
+        self.assertIsInstance(match.kwargs["section"], str)
+        for path_ in ("/old/", "/root/mid/news/page/not-an-int/", "/root/mid/"):
+            with self.subTest(path=path_):
+                with self.assertRaises(Resolver404):
+                    resolve(path_, urlconf)
+
+    def test_failure_before_refresh_does_not_poison_refresh(self):
+        urlconf = _MutableURLconf([path("old/", old_view, name="old")])
+        with self.assertRaises(Resolver404):
+            resolve("/does-not-exist/", urlconf)
+        urlconf.urlpatterns = [path("new/<int:id>/", new_view, name="new")]
+        match = resolve("/new/5/", urlconf)
+        self.assertIs(match.func, new_view)
+        self.assertEqual(match.kwargs, {"id": 5})
+
+    def test_old_path_404_right_after_refresh(self):
+        urlconf = _MutableURLconf([path("old/<int:pk>/", old_view)])
+        resolve("/old/1/", urlconf)
+        urlconf.urlpatterns = [path("new/<int:id>/", new_view)]
+        with self.assertRaises(Resolver404):
+            resolve("/old/1/", urlconf)
+
+    def test_alternating_urlconf_objects(self):
+        first = _MutableURLconf(
+            [path("first/<int:pk>/", old_view, name="first")]
+        )
+        second = _MutableURLconf(
+            [
+                path(
+                    "second/<slug:tag>/",
+                    include(
+                        ([path("item/", new_view, name="item")], "secondapp"),
+                        namespace="secondns",
+                    ),
+                )
+            ]
+        )
+        for _ in range(3):
+            one = resolve("/first/1/", first)
+            self.assertIs(one.func, old_view)
+            self.assertEqual(one.kwargs, {"pk": 1})
+            self.assertEqual(one.namespaces, [])
+            two = resolve("/second/red/item/", second)
+            self.assertIs(two.func, new_view)
+            self.assertEqual(two.kwargs, {"tag": "red"})
+            self.assertEqual(two.namespaces, ["secondns"])
+        # A failure against one table never carries into the other.
+        with self.assertRaises(Resolver404):
+            resolve("/first/missing/", first)
+        two = resolve("/second/blue/item/", second)
+        self.assertEqual(two.kwargs, {"tag": "blue"})
+        self.assertEqual(two.namespaces, ["secondns"])
+
+    def test_converter_and_encoding_rules_against_current_table(self):
+        urlconf = _MutableURLconf([path("old/", old_view)])
+        resolve("/old/", urlconf)
+        urlconf.urlpatterns = [path("value/<slug:tag>/<int:num>/", new_view)]
+
+        match = resolve("/value/hello/8/", urlconf)
+        self.assertEqual(match.kwargs, {"tag": "hello", "num": 8})
+        self.assertIsInstance(match.kwargs["num"], int)
+        # A percent escape is decoded exactly once, then re-validated and
+        # converted; bad values, malformed escapes and missing or extra path
+        # segments are all plain Resolver404s.
+        for path_ in (
+            "/value/hello/not-an-int/",
+            "/value/has-dash.tag/8/",
+            "/value/hello/8%/",
+            "/value/hello/%GG/",
+            "/value/hello/",
+            "/value/hello/8/extra/",
+        ):
+            with self.subTest(path=path_):
+                with self.assertRaises(Resolver404):
+                    resolve(path_, urlconf)
+
+    def test_invalid_new_table_does_not_break_other_urlconf(self):
+        healthy = _MutableURLconf([path("healthy/", old_view, name="healthy")])
+        changing = _MutableURLconf([path("changing/<int:pk>/", new_view)])
+        self.assertIs(resolve("/healthy/", healthy).func, old_view)
+        self.assertEqual(resolve("/changing/2/", changing).kwargs, {"pk": 2})
+
+        changing.urlpatterns = object()  # not iterable -> invalid URLconf
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/changing/2/", changing)
+        # The previously working, unrelated URLconf is untouched...
+        self.assertIs(resolve("/healthy/", healthy).func, old_view)
+        # ...and fixing the table takes effect immediately.
+        changing.urlpatterns = [path("fixed/<int:n>/", new_view, name="fixed")]
+        match = resolve("/fixed/9/", changing)
+        self.assertIs(match.func, new_view)
+        self.assertEqual(match.kwargs, {"n": 9})
+
+    def test_equivalent_replacement_is_stable_and_order_independent(self):
+        def patterns():
+            return [
+                path(
+                    "eq/<int:pk>/",
+                    include(
+                        ([path("sub/<slug:slug>/", new_view, name="sub")], "eqapp"),
+                        namespace="eqns",
+                    ),
+                )
+            ]
+
+        urlconf = _MutableURLconf(patterns())
+        untouched = _MutableURLconf(
+            [re_path(r"^plain/(?P<year>[0-9]{4})/$", old_view, name="plain")]
+        )
+        first = resolve("/eq/1/sub/x/", urlconf)
+        urlconf.urlpatterns = patterns()
+        second = resolve("/eq/1/sub/x/", urlconf)
+        self.assertEqual(self._snapshot(first), self._snapshot(second))
+        # Interleaving with another (old-style, non-namespaced) URLconf does
+        # not perturb either result.
+        plain_match = resolve("/plain/2024/", untouched)
+        self.assertEqual(plain_match.kwargs, {"year": "2024"})
+        self.assertEqual(plain_match.namespaces, [])
+        third = resolve("/eq/1/sub/x/", urlconf)
+        self.assertEqual(self._snapshot(third), self._snapshot(first))
 
 
 _LOCALE_DIR = os.path.join(os.path.dirname(__file__), "locale")
