@@ -252,59 +252,155 @@ def _compiled_converter_regex(regex):
 
 # A well-formed percent-encoded octet, e.g. "%2F" or "%c3".
 _PERCENT_ENCODED_RE = r"%[0-9A-Fa-f]{2}"
-# A literal '%' that does not begin a well-formed escape. It is disjoint
-# from _PERCENT_ENCODED_RE, so the two alternatives can never compete for
-# the same input (which would make matching exponentially ambiguous).
-_LONE_PERCENT_RE = r"%(?![0-9A-Fa-f]{2})"
+# Zero-width regex escapes (anchors and word boundaries); they consume no
+# character and are passed through the raw-regex rewrite unchanged.
+_ZERO_WIDTH_ESCAPES = frozenset("AbBZ")
+
+
+def _find_char_class_end(regex, start):
+    """Return the index just past the ']' closing a class opened at start-1."""
+    i = start
+    # A leading '^' (negation) and a ']' placed first are both literal.
+    if i < len(regex) and regex[i] == "^":
+        i += 1
+    if i < len(regex) and regex[i] == "]":
+        i += 1
+    while i < len(regex):
+        if regex[i] == "\\":
+            i += 2
+            continue
+        if regex[i] == "]":
+            return i + 1
+        i += 1
+    return len(regex)
+
+
+def _find_group_end(regex, start):
+    """Return the index just past the ')' closing the group opened at start."""
+    depth = 0
+    i = start
+    while i < len(regex):
+        c = regex[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            i = _find_char_class_end(regex, i + 1)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(regex)
+
+
+def _raw_atom(atom):
+    # The raw-path counterpart of a single-character converter atom (a
+    # character class, '.', a shorthand class such as \d, or one literal
+    # character). It matches exactly one *decoded* character position in one
+    # of two disjoint ways:
+    #   * the atom itself, unless it begins a well-formed percent escape, or
+    #   * a whole percent-encoded octet (which is decoded and re-validated by
+    #     the caller).
+    # At a well-formed escape only the second alternative can match; at every
+    # other position only the first can. The split is therefore unique and
+    # matching stays linear. A raw '/' is consumed only when the atom admits
+    # it, while an encoded "%2F" is decoded afterwards and re-checked against
+    # the converter, so an encoded slash can neither open a new path level nor
+    # be smuggled past a converter that rejects '/'.
+    return f"(?:(?!{_PERCENT_ENCODED_RE}){atom}|{_PERCENT_ENCODED_RE})"
+
+
+@functools.lru_cache
+def _raw_converter_regex(regex):
+    """
+    Rewrite a converter's (decoded-value) regex into one that matches the same
+    values on a raw, still percent-encoded path.
+
+    Each single-character atom is wrapped by _raw_atom(), while groups,
+    alternations, anchors and quantifiers are left in place. Keeping the
+    quantifiers attached to one-position atoms makes them count *decoded*
+    characters: for the year converter "[0-9]{4}", "2026" may arrive as
+    "20%326", "%32026" or "%32%30%32%36" and still occupy exactly four
+    positions, rather than being rejected because raw runs and escape runs
+    were counted separately. RoutePattern.match() re-checks the decoded
+    capture against the original converter regex, so this broadening cannot
+    let an invalid value through.
+    """
+    out = []
+    i = 0
+    n = len(regex)
+    while i < n:
+        c = regex[i]
+        if c == "[":
+            j = _find_char_class_end(regex, i + 1)
+            out.append(_raw_atom(regex[i:j]))
+            i = j
+        elif c == "(":
+            j = _find_group_end(regex, i)
+            group = regex[i:j]
+            if group.startswith("(?P<") and ">" in group:
+                inner_start = group.index(">") + 1
+            elif group.startswith("(?:"):
+                inner_start = 3
+            elif group[1:2] != "?":
+                # A plain capturing group.
+                inner_start = 1
+            else:
+                # Assertions, conditionals, comments, ... are zero-width or
+                # otherwise untransformable and are passed through verbatim.
+                out.append(group)
+                i = j
+                continue
+            opener = group[:inner_start]
+            inner = group[inner_start:-1]
+            out.append(opener + _raw_converter_regex(inner) + ")")
+            i = j
+        elif c == "\\":
+            nxt = regex[i + 1] if i + 1 < n else ""
+            if nxt in _ZERO_WIDTH_ESCAPES or nxt.isdigit():
+                # Anchors/word boundaries and backreferences are verbatim.
+                out.append(regex[i : i + 2])
+            else:
+                # Shorthand classes (\d, \w, \s and negations) and escaped
+                # literals (\., \-, \\, \/, ...) each occupy one position.
+                out.append(_raw_atom(regex[i : i + 2]))
+            i += 2
+        elif c == ".":
+            out.append(_raw_atom("."))
+            i += 1
+        elif c in "*+?^$|":
+            # Quantifiers, alternation and anchors keep their meaning.
+            out.append(c)
+            i += 1
+        elif c == "{":
+            j = regex.find("}", i)
+            if j == -1:
+                out.append(_raw_atom(c))
+                i += 1
+            else:
+                # A bounded/general quantifier applies to the atom just
+                # emitted and is copied through unchanged.
+                out.append(regex[i : j + 1])
+                i = j + 1
+        else:
+            out.append(_raw_atom(c))
+            i += 1
+    return "".join(out)
 
 
 def _match_capture(parameter, converter_regex):
-    # The raw-path counterpart of a converter's capture. Matching runs
-    # against the still-encoded path so that an encoded slash ("%2F")
-    # cannot introduce a new path level. The pieces are pairwise disjoint
-    # and fixed-width, so an input string has a single possible split and
-    # matching stays linear:
-    #   * a well-formed percent escape is consumed as one 3-character token
-    #     and decoded later (an encoded slash can therefore never open a new
-    #     path level),
-    #   * a lone, non-escape '%' is only accepted when the converter itself
-    #     accepts '%' (the path may already have been decoded once by WSGI),
-    #   * everything else is matched by the converter's own regex, whose
-    #     greediness still decides where the capture ends relative to route
-    #     literals (so <int:pk>-<slug:slug> cannot let '-' bleed into pk).
-    # The decoded capture is re-validated against the converter regex before
-    # conversion, so broadening it with escapes cannot let an invalid value
-    # through.
-    escape = _PERCENT_ENCODED_RE
-    if "%" not in converter_regex and _compiled_converter_regex(
-        converter_regex
-    ).fullmatch("%") is None:
-        # The converter never involves '%' (built-in int/slug/uuid, most
-        # custom converters). Converter runs and escape tokens are then
-        # disjoint and fixed-width: a run never consumes a '%', so at every
-        # '%' position the escape token is the single possible move. This
-        # keeps the converter's own greediness (so "<int:pk>-<slug:slug>"
-        # cannot let '-' bleed into pk) and matching linear.
-        run = f"(?:{converter_regex})?"
-        token = f"{run}(?:{escape}{run})*"
-    else:
-        # The converter accepts '%' itself (<str>, <path> or a custom
-        # converter whose regex mentions '%'). Raw runs are single
-        # characters taken from everything except '%' (and, when the
-        # converter rejects it, '/'); '%' only reaches them through an
-        # escape or the disjoint lone-percent token. Splitting into
-        # fixed-width single-character tokens prevents an exponentially
-        # ambiguous split when the converter regex would itself match an
-        # escape sequence. Newlines are excluded, mirroring a converter
-        # regex that uses '.'. The post-match fullmatch against the
-        # converter regex keeps its value restrictions.
-        allows_slash = (
-            _compiled_converter_regex(converter_regex).fullmatch("/") is not None
-        )
-        raw_char = r"[^%\n]" if allows_slash else r"[^%/\n]"
-        run = f"(?:{raw_char}|{_LONE_PERCENT_RE})*"
-        token = f"{run}(?:{escape}{run})*"
-    return f"(?P<{parameter}>{token})"
+    # The raw-path counterpart of a converter's capture. Matching runs against
+    # the still-encoded path so that an encoded slash ("%2F") cannot introduce
+    # a new path level; _raw_converter_regex() preserves the converter's
+    # structure (including bounded quantifiers such as "{4}") so that raw and
+    # percent-encoded characters are interchangeable. The decoded capture is
+    # re-validated against the converter regex before conversion, so admitting
+    # escapes cannot let an invalid value through.
+    return f"(?P<{parameter}>{_raw_converter_regex(converter_regex)})"
 
 
 def _decode_route_capture(value):

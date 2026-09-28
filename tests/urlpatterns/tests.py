@@ -497,6 +497,78 @@ class EncodedPathResolveTests(SimpleTestCase):
         self.assertEqual(match.kwargs["number"], 37)
         self.assertIsInstance(match.kwargs["number"], int)
 
+    def test_bounded_converter_counts_decoded_positions(self):
+        # A bounded quantifier such as the year converter's "{4}" counts
+        # decoded characters. The four digits may be all raw, all encoded, or
+        # any mix of the two and must reach the same view with the same int.
+        for url in (
+            "/blog/2026/",
+            "/blog/%32%30%32%36/",
+            "/blog/%32026/",
+            "/blog/20%326/",
+            "/blog/%32%3026/",
+        ):
+            with self.subTest(url=url):
+                match = resolve(url)
+                self.assertEqual(match.view_name, "blog-year")
+                self.assertEqual(match.kwargs, {"year": 2026})
+                self.assertIsInstance(match.kwargs["year"], int)
+        # The wrong number of digits cannot match the bounded year route; it
+        # falls through to the <path> sibling instead of partially matching.
+        for url, rest in (
+            ("/blog/202/", "202"),
+            ("/blog/20267/", "20267"),
+            ("/blog/20%32/", "202"),
+        ):
+            with self.subTest(url=url):
+                match = resolve(url)
+                self.assertEqual(match.view_name, "blog-rest")
+                self.assertEqual(match.kwargs, {"rest": rest})
+        # A value that smuggles a level with %2F is rejected by the year
+        # converter and reaches the <path> sibling with the slash as content.
+        match = resolve("/blog/20%2F26/")
+        self.assertEqual(match.view_name, "blog-rest")
+        self.assertEqual(match.kwargs, {"rest": "20/26"})
+
+    def test_bounded_converter_under_namespace_and_language(self):
+        # The bound keeps counting decoded positions through an application
+        # namespace and an en/zh language prefix.
+        for url, lang in (
+            ("/en/loc/blue/year/2026/", "en"),
+            ("/en/loc/blue/year/%32026/", "en"),
+            ("/zh/loc/red/year/20%326/", "zh"),
+        ):
+            with override(lang):
+                match = resolve(url)
+            self.assertEqual(match.view_name, "inner:year")
+            self.assertEqual(match.namespaces, ["inner"])
+            self.assertEqual(match.kwargs["year"], 2026)
+            self.assertIsInstance(match.kwargs["year"], int)
+
+    def test_bounded_converter_switching_languages_is_stable(self):
+        en_url = "/en/loc/blue/year/%32026/"
+        zh_url = "/zh/loc/red/year/%32%3026/"
+        with override("en"):
+            en_first = resolve(en_url)
+        with override("zh"):
+            zh_first = resolve(zh_url)
+        sequence = (
+            (en_url, "en", en_first),
+            (zh_url, "zh", zh_first),
+            (en_url, "en", en_first),
+            (zh_url, "zh", zh_first),
+        )
+        for url, lang, baseline in sequence:
+            with override(lang):
+                match = resolve(url)
+            self.assertEqual(match.view_name, baseline.view_name)
+            self.assertEqual(match.namespaces, baseline.namespaces)
+            self.assertEqual(match.kwargs, baseline.kwargs)
+            self.assertEqual(
+                {k: type(v) for k, v in match.kwargs.items()},
+                {k: type(v) for k, v in baseline.kwargs.items()},
+            )
+
     def test_encoded_slash_is_path_converter_content(self):
         # %2F stays parameter content for <path>: one parameter, decoded
         # once, and never split into extra path levels.

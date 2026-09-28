@@ -48,3 +48,16 @@ class DecodedIntConverter:
 
     def to_url(self, value):
         return str(value)
+
+
+class DecodedFourDigitYearConverter:
+    # A bounded converter (the canonical "year" converter). The {4} quantifier
+    # counts decoded characters, so the four digits may arrive mixed raw and
+    # percent-encoded ("20%326", "%32026", ...) and still match exactly once.
+    regex = "[0-9]{4}"
+
+    def to_python(self, value):
+        return int(value)
+
+    def to_url(self, value):
+        return "%04d" % value
