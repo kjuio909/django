@@ -1,6 +1,8 @@
+import os
 import string
 import uuid
 
+from django.conf.urls.i18n import i18n_patterns
 from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 from django.test.utils import override_settings
@@ -14,11 +16,18 @@ from django.urls import (
     resolve,
     reverse,
 )
-from django.urls.converters import REGISTERED_CONVERTERS, IntConverter
+from django.urls.converters import REGISTERED_CONVERTERS, IntConverter, get_converters
+from django.urls.resolvers import _route_to_regex
 from django.utils.translation import override
 from django.views import View
 
-from .converters import Base64Converter, DynamicConverter
+from .converters import (
+    Base64Converter,
+    BoundedTextConverter,
+    DynamicConverter,
+    NoneReturningConverter,
+    RejectingConverter,
+)
 from .views import empty_view
 
 included_kwargs = {"base": b"hello", "value": b"world"}
@@ -786,3 +795,334 @@ class TemporaryURLConfResolveTests(SimpleTestCase):
             resolve("/fr/loc/b/article/5/", urlconf)
         after = resolve("/plain/5/", urlconf)
         self.assertEqual(self._snapshot(before), self._snapshot(after))
+
+
+_LOCALE_DIR = os.path.join(os.path.dirname(__file__), "locale")
+
+
+def _i18n_acceptance_urlconf(prefix_default_language):
+    # A temporary URLconf handed directly to resolve() as an unhashable
+    # list: two levels of include() with application namespaces, language
+    # prefixes whose default-prefix behavior is switchable, a plain route
+    # and an old-style, non-namespaced re_path().
+    inner_urlpatterns = [
+        path("article/<int:pk>/", empty_view, name="article"),
+        path("code/<btext:code>/", empty_view, name="code"),
+    ]
+    middle_urlpatterns = [
+        path(
+            "sec/<slug:section>/",
+            include((inner_urlpatterns, "inner"), namespace="inner"),
+        ),
+    ]
+    return [
+        *i18n_patterns(
+            path(
+                "top/<slug:book>/",
+                include((middle_urlpatterns, "mid"), namespace="mid"),
+            ),
+            prefix_default_language=prefix_default_language,
+        ),
+        path("plain/<int:pk>/", empty_view, name="plain"),
+        re_path(r"^legacy/(?P<rest>.+)/$", empty_view, name="legacy"),
+    ]
+
+
+@override_settings(
+    USE_I18N=True,
+    LANGUAGE_CODE="en",
+    LANGUAGES=[("en", "English"), ("zh", "Chinese")],
+    LOCALE_PATHS=[_LOCALE_DIR],
+)
+class I18NPrefixAndConverterResolveTests(SimpleTestCase):
+    """
+    Stable forward resolution (django.urls.resolve) under switchable default
+    language prefixes and custom-converter boundaries. Every call is driven
+    solely by the URLconf and path it receives.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._registered = {}
+        for type_name, converter_cls in (
+            ("btext", BoundedTextConverter),
+            ("reject", RejectingConverter),
+            ("noneval", NoneReturningConverter),
+        ):
+            instance = converter_cls()
+            cls._registered[type_name] = REGISTERED_CONVERTERS.get(type_name)
+            REGISTERED_CONVERTERS[type_name] = instance
+        get_converters.cache_clear()
+        _route_to_regex.cache_clear()
+
+    @classmethod
+    def tearDownClass(cls):
+        for type_name, previous in cls._registered.items():
+            if previous is None:
+                REGISTERED_CONVERTERS.pop(type_name, None)
+            else:
+                REGISTERED_CONVERTERS[type_name] = previous
+        get_converters.cache_clear()
+        _route_to_regex.cache_clear()
+        super().tearDownClass()
+
+    def _snapshot(self, match):
+        return (
+            match.func,
+            match.url_name,
+            tuple(match.args),
+            tuple((k, v, type(v)) for k, v in sorted(match.kwargs.items())),
+            tuple(match.app_names),
+            tuple(match.namespaces),
+            match.route,
+        )
+
+    def _urlconf_pair(self):
+        return (
+            _i18n_acceptance_urlconf(True),
+            _i18n_acceptance_urlconf(False),
+        )
+
+    # -- default-language prefix switch -----------------------------------
+
+    def test_prefixed_default_and_other_language(self):
+        urlconf, _ = self._urlconf_pair()
+        en = resolve("/en/top/book1/sec/sec1/article/10/", urlconf)
+        zh = resolve("/zh/top/book2/sec/sec2/article/20/", urlconf)
+        self.assertEqual(en.view_name, "mid:inner:article")
+        self.assertEqual(zh.view_name, "mid:inner:article")
+        self.assertEqual(en.namespaces, ["mid", "inner"])
+        self.assertEqual(en.app_names, ["mid", "inner"])
+        self.assertEqual(en.kwargs, {"book": "book1", "section": "sec1", "pk": 10})
+        self.assertEqual(zh.kwargs, {"book": "book2", "section": "sec2", "pk": 20})
+        self.assertIsInstance(en.kwargs["pk"], int)
+        self.assertEqual(
+            en.route,
+            "en/top/<slug:book>/sec/<slug:section>/article/<int:pk>/",
+        )
+        self.assertEqual(
+            zh.route,
+            "zh/top/<slug:book>/sec/<slug:section>/article/<int:pk>/",
+        )
+        # The request's prefix, not the active language, decides the match.
+        with override("zh"):
+            en_switched = resolve("/en/top/book1/sec/sec1/article/10/", urlconf)
+        with override("en"):
+            zh_switched = resolve("/zh/top/book2/sec/sec2/article/20/", urlconf)
+        self.assertEqual(self._snapshot(en_switched), self._snapshot(en))
+        self.assertEqual(self._snapshot(zh_switched), self._snapshot(zh))
+        # With prefixing on, the default language has no unprefixed mount.
+        with self.assertRaises(Resolver404):
+            resolve("/top/book1/sec/sec1/article/10/", urlconf)
+
+    def test_unprefixed_default_language_only(self):
+        _, urlconf = self._urlconf_pair()
+        unprefixed = resolve("/top/book1/sec/sec1/article/10/", urlconf)
+        self.assertEqual(unprefixed.view_name, "mid:inner:article")
+        self.assertEqual(
+            unprefixed.kwargs, {"book": "book1", "section": "sec1", "pk": 10}
+        )
+        self.assertEqual(
+            unprefixed.route,
+            "top/<slug:book>/sec/<slug:section>/article/<int:pk>/",
+        )
+        # The extra default-language prefix always fails and never reaches an
+        # unprefixed sibling, regardless of the active language.
+        for active in ("en", "zh"):
+            with self.subTest(active=active), override(active):
+                with self.assertRaises(Resolver404):
+                    resolve("/en/top/book1/sec/sec1/article/10/", urlconf)
+        # The unprefixed request is the default mount even with zh active:
+        # the language never leaks into the captured parameters.
+        with override("zh"):
+            switched = resolve("/top/book1/sec/sec1/article/10/", urlconf)
+        self.assertEqual(self._snapshot(switched), self._snapshot(unprefixed))
+        # The non-default language still needs its prefix.
+        with override("en"):
+            zh = resolve("/zh/top/book2/sec/sec2/article/20/", urlconf)
+        self.assertEqual(zh.kwargs, {"book": "book2", "section": "sec2", "pk": 20})
+
+    def test_mismatched_active_language_segment_is_not_captured(self):
+        urlconf, _ = self._urlconf_pair()
+        with override("zh"):
+            match = resolve("/en/top/book1/sec/sec1/article/10/", urlconf)
+        self.assertNotIn("en", match.kwargs.values())
+        self.assertEqual(
+            match.kwargs, {"book": "book1", "section": "sec1", "pk": 10}
+        )
+        # The prefixed mount cannot masquerade as the plain sibling.
+        with self.assertRaises(Resolver404):
+            resolve("/en/plain/10/", urlconf)
+
+    # -- alternation / repeatability --------------------------------------
+
+    def test_alternating_paths_then_back_to_first(self):
+        urlconf, _ = self._urlconf_pair()
+        first = self._snapshot(resolve("/en/top/b/sec/s/article/1/", urlconf))
+        resolve("/zh/top/c/sec/t/article/2/", urlconf)
+        legacy = resolve("/legacy/a%2Fb/", urlconf)
+        self.assertEqual(legacy.view_name, "legacy")
+        self.assertEqual(legacy.namespaces, [])
+        self.assertEqual(legacy.app_names, [])
+        self.assertEqual(legacy.kwargs, {"rest": "a%2Fb"})
+        again = self._snapshot(resolve("/en/top/b/sec/s/article/1/", urlconf))
+        self.assertEqual(again, first)
+
+    def test_call_order_does_not_change_results(self):
+        urlconf, _ = self._urlconf_pair()
+        paths = [
+            "/en/top/b/sec/s/article/1/",
+            "/zh/top/c/sec/t/article/2/",
+            "/legacy/x/",
+            "/plain/3/",
+        ]
+
+        def run(order):
+            return [self._snapshot(resolve(p, urlconf)) for p in order]
+
+        forward = run(paths)
+        backward = run(reversed(paths))
+        self.assertEqual(forward, list(reversed(backward)))
+
+    def test_same_path_resolves_identically_on_repeat(self):
+        urlconf, _ = self._urlconf_pair()
+        first = self._snapshot(resolve("/en/top/b/sec/s/code/ab/", urlconf))
+        for _ in range(3):
+            self.assertEqual(
+                self._snapshot(resolve("/en/top/b/sec/s/code/ab/", urlconf)),
+                first,
+            )
+
+    # -- custom converter --------------------------------------------------
+
+    def test_bounded_converter_accepts_and_returns_single_value(self):
+        urlconf, _ = self._urlconf_pair()
+        match = resolve("/en/top/b/sec/s/code/ab/", urlconf)
+        self.assertEqual(match.view_name, "mid:inner:code")
+        self.assertEqual(
+            match.kwargs, {"book": "b", "section": "s", "code": "AB"}
+        )
+        self.assertIsInstance(match.kwargs["code"], str)
+        self.assertEqual(match.captured_kwargs, {"code": "AB"})
+
+    def test_encoded_unicode_space_and_reserved_chars_decoded_once(self):
+        urlconf, _ = self._urlconf_pair()
+        match = resolve(
+            "/zh/top/b/sec/s/code/caf%C3%A9%20x%3F%26%3D%3A/", urlconf
+        )
+        # caf%C3%A9 -> café, %20 -> space, %3F%26%3D%3A -> ?&=:; to_python()
+        # receives the decoded text exactly once.
+        self.assertEqual(match.kwargs["code"], "CAFÉ X?&=:")
+        self.assertEqual(
+            list(match.kwargs), ["book", "section", "code"]
+        )
+
+    def test_encoded_acceptable_value_decoded_once(self):
+        urlconf, _ = self._urlconf_pair()
+        match = resolve("/en/top/b/sec/s/code/%61%62/", urlconf)
+        self.assertEqual(match.kwargs["code"], "AB")
+        # Double-encoded text decodes once into a literal '%' the converter
+        # regex rejects; it never gets decoded a second time.
+        with self.assertRaises(Resolver404):
+            resolve("/en/top/b/sec/s/code/%2561%2562/", urlconf)
+
+    def test_encoded_slash_does_not_change_path_level(self):
+        urlconf, _ = self._urlconf_pair()
+        with self.assertRaises(Resolver404):
+            resolve("/en/top/b/sec/s/code/a%2Fb/", urlconf)
+
+    def test_bounded_converter_rejects_invalid_values(self):
+        urlconf, _ = self._urlconf_pair()
+        invalid_paths = (
+            "/en/top/b/sec/s/code//",                    # empty
+            "/en/top/b/sec/s/code/abcdefghijklm/",       # over the bound
+            "/en/top/b/sec/s/code/ab%2A/",               # encoded '*'
+            "/en/top/b/sec/s/code/ab%/",                 # malformed escape
+            "/en/top/b/sec/s/code/ab%ZZ/",               # malformed escape
+            "/en/top/b/sec/s/code/%ff%fe/",              # invalid UTF-8
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, urlconf)
+
+    def test_rejecting_and_none_returning_converters_are_404(self):
+        urlconf = [
+            path("bad/<reject:n>/", empty_view, name="bad"),
+            path("nil/<noneval:n>/", empty_view, name="nil"),
+        ]
+        with self.assertRaises(Resolver404):
+            resolve("/bad/5/", urlconf)
+        with self.assertRaises(Resolver404):
+            resolve("/nil/5/", urlconf)
+
+    # -- failure semantics -------------------------------------------------
+
+    def test_invalid_requests_only_raise_resolver404(self):
+        urlconf, _ = self._urlconf_pair()
+        invalid_paths = (
+            "/xx/top/b/sec/s/article/1/",        # unknown language
+            "/en/top/b/sec/s/article/",          # missing capture
+            "/en/top/b/sec/s/article/1/more/",   # extra path
+            "/en//top/b/sec/s/article/1/",       # duplicate slash
+            "/plain//7/",                        # duplicate slash
+            "/plain/7/?x=1",                     # query string
+            "/plain/7/#frag",                    # fragment
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, urlconf)
+
+    def test_failure_leaves_no_state_for_the_next_call(self):
+        urlconf, _ = self._urlconf_pair()
+        baseline = self._snapshot(resolve("/plain/7/", urlconf))
+        for path in (
+            "/plain/not-an-int/",
+            "/xx/top/b/sec/s/article/1/",
+            "/en/top/b/sec/s/article/not-an-int/",
+            "/en/top/b/sec/s/code/ab%2A/",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, urlconf)
+        self.assertEqual(self._snapshot(resolve("/plain/7/", urlconf)), baseline)
+
+    def test_switching_prefix_flag_leaves_no_state(self):
+        prefixed, unprefixed = self._urlconf_pair()
+        prefixed_match = self._snapshot(
+            resolve("/en/top/b/sec/s/article/1/", prefixed)
+        )
+        unprefixed_match = self._snapshot(
+            resolve("/top/b/sec/s/article/1/", unprefixed)
+        )
+        # Re-resolution after using the other URLconf is unchanged.
+        self.assertEqual(
+            self._snapshot(resolve("/en/top/b/sec/s/article/1/", prefixed)),
+            prefixed_match,
+        )
+        self.assertEqual(
+            self._snapshot(resolve("/top/b/sec/s/article/1/", unprefixed)),
+            unprefixed_match,
+        )
+        # The prefix switch cannot change converter types or parameter keys.
+        plain_prefixed = resolve("/plain/9/", prefixed)
+        plain_unprefixed = resolve("/plain/9/", unprefixed)
+        self.assertEqual(set(plain_prefixed.kwargs), set(plain_unprefixed.kwargs))
+        self.assertEqual(
+            {k: type(v) for k, v in plain_prefixed.kwargs.items()},
+            {k: type(v) for k, v in plain_unprefixed.kwargs.items()},
+        )
+
+    # -- non-internationalized compatibility ------------------------------
+
+    def test_plain_route_name_and_trailing_slash(self):
+        urlconf, _ = self._urlconf_pair()
+        match = resolve("/plain/7/", urlconf)
+        self.assertEqual(match.view_name, "plain")
+        self.assertEqual(match.namespaces, [])
+        self.assertEqual(match.kwargs, {"pk": 7})
+        self.assertIsInstance(match.kwargs["pk"], int)
+        with self.assertRaises(Resolver404):
+            resolve("/plain/7", urlconf)

@@ -48,3 +48,42 @@ class DecodedIntConverter:
 
     def to_url(self, value):
         return str(value)
+
+
+class BoundedTextConverter:
+    # One to twelve characters admitting Unicode text, spaces and reserved
+    # URL characters, but never a '%', a '/' or a '*'. Matching runs against
+    # the raw path: a percent escape is decoded once and then re-validated
+    # against this regex, so an encoded slash or star cannot be smuggled in
+    # and an over-long value stays bounded.
+    regex = r"[^%/*\n]{1,12}"
+
+    def to_python(self, value):
+        # Return a distinct type of value (upper-cased) so tests can assert
+        # the decoded text -- not its raw encoding -- reached the converter
+        # exactly once.
+        return value.upper()
+
+    def to_url(self, value):
+        return str(value).lower()
+
+
+class RejectingConverter:
+    # Accepts the text syntactically, but the value is always rejected.
+    regex = "[0-9]+"
+
+    def to_python(self, value):
+        raise ValueError("value is not allowed")
+
+    def to_url(self, value):
+        return str(value)
+
+
+class NoneReturningConverter:
+    regex = "[0-9]+"
+
+    def to_python(self, value):
+        return None
+
+    def to_url(self, value):
+        return str(value)
