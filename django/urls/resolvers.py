@@ -24,7 +24,7 @@ from django.utils.datastructures import MultiValueDict
 from django.utils.functional import cached_property
 from django.utils.http import RFC3986_SUBDELIMS, escape_leading_slashes
 from django.utils.regex_helper import _lazy_re_compile, normalize
-from django.utils.translation import get_language
+from django.utils.translation import get_language, get_supported_language_variant
 
 from .converters import get_converters
 from .exceptions import NoReverseMatch, Resolver404
@@ -539,6 +539,22 @@ class LocalePrefixPattern:
         language_prefix = self.language_prefix
         if path.startswith(language_prefix):
             return path.removeprefix(language_prefix), (), {}
+        # Resolution is driven by the requested path, not by the active
+        # language: a path carrying any supported language prefix must
+        # resolve identically no matter which language is active when
+        # resolve() is called. When prefix_default_language is False the
+        # default language is intentionally mounted without a prefix, so a
+        # prefixed request for it stays a non-match as before. Unknown
+        # prefixes (and unprefixed paths) likewise keep failing to match.
+        if self.prefix_default_language:
+            prefix, sep, rest = path.partition("/")
+            if sep:
+                try:
+                    get_supported_language_variant(prefix)
+                except LookupError:
+                    pass
+                else:
+                    return rest, (), {}
         return None
 
     def check(self):
