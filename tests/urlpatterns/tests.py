@@ -7,6 +7,7 @@ from django.test.utils import override_settings
 from django.urls import (
     NoReverseMatch,
     Resolver404,
+    include,
     path,
     re_path,
     register_converter,
@@ -425,6 +426,17 @@ class ConversionExceptionTests(SimpleTestCase):
         with self.assertRaises(Resolver404):
             resolve("/dynamic/abc/")
 
+    def test_resolve_none_return_means_no_match(self):
+        # A converter that returns None instead of raising reports "no
+        # value", which is a non-match rather than None reaching the view as
+        # a keyword argument.
+        @DynamicConverter.register_to_python
+        def returns_none(value):
+            return None
+
+        with self.assertRaises(Resolver404):
+            resolve("/dynamic/abc/")
+
     def test_reverse_value_error_means_no_match(self):
         @DynamicConverter.register_to_url
         def raises_value_error(value):
@@ -632,3 +644,145 @@ class EncodedPathResolveTests(SimpleTestCase):
         self.assertEqual(match.namespaces, [])
         self.assertEqual(match.app_names, [])
         self.assertEqual(match.kwargs, {"rest": "a%2Fb"})
+
+
+def _temporary_i18n_urlconf(prefix_default_language):
+    # A URLconf built for the duration of a single resolve() call, handed
+    # over directly as an (unhashable) list rather than installed as
+    # settings.ROOT_URLCONF.
+    from django.conf.urls.i18n import i18n_patterns
+
+    inner = [path("article/<int:pk>/", empty_view, name="article")]
+    return [
+        *i18n_patterns(
+            path("loc/<slug:book>/", include((inner, "inner"), namespace="inner")),
+            prefix_default_language=prefix_default_language,
+        ),
+        path("plain/<int:pk>/", empty_view, name="plain"),
+        re_path(r"^legacy/(?P<rest>.+)/$", empty_view, name="legacy"),
+    ]
+
+
+class TemporaryURLConfResolveTests(SimpleTestCase):
+    """
+    resolve() must accept a caller-supplied, temporary URLconf -- including a
+    plain list of patterns -- and language-prefix matching must be driven by
+    the requested path, never by the active language.
+    """
+
+    def _snapshot(self, match):
+        return (
+            match.view_name,
+            match.url_name,
+            match.args,
+            dict(match.kwargs),
+            list(match.app_names),
+            list(match.namespaces),
+            match.route,
+            {key: type(value) for key, value in match.kwargs.items()},
+        )
+
+    def test_unhashable_list_urlconf_resolves(self):
+        urlconf = _temporary_i18n_urlconf(True)
+        match = resolve("/en/loc/blue/article/1/", urlconf)
+        self.assertEqual(match.view_name, "inner:article")
+        self.assertEqual(match.namespaces, ["inner"])
+        self.assertEqual(match.kwargs, {"book": "blue", "pk": 1})
+        self.assertIsInstance(match.kwargs["pk"], int)
+
+    def test_prefixed_default_language(self):
+        urlconf = _temporary_i18n_urlconf(True)
+        with override("en"):
+            default = resolve("/en/loc/blue/article/1/", urlconf)
+            other = resolve("/fr/loc/red/article/2/", urlconf)
+        # The path's prefix, not the active language, decides the match.
+        with override("fr"):
+            default_switched = resolve("/en/loc/blue/article/1/", urlconf)
+            other_switched = resolve("/fr/loc/red/article/2/", urlconf)
+        self.assertEqual(self._snapshot(default), self._snapshot(default_switched))
+        self.assertEqual(self._snapshot(other), self._snapshot(other_switched))
+        self.assertEqual(default.view_name, other.view_name)
+        self.assertEqual(default.namespaces, other.namespaces)
+        self.assertEqual(default.app_names, other.app_names)
+        self.assertEqual(
+            default.route, "en/loc/<slug:book>/article/<int:pk>/"
+        )
+        self.assertEqual(other.route, "fr/loc/<slug:book>/article/<int:pk>/")
+        # No-prefix requests and unknown languages keep failing.
+        for path in ("/loc/blue/article/1/", "/xx/loc/blue/article/1/"):
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, urlconf)
+
+    def test_unprefixed_default_language(self):
+        urlconf = _temporary_i18n_urlconf(False)
+        # The default language is only reachable without its prefix.
+        unprefixed = resolve("/loc/blue/article/1/", urlconf)
+        self.assertEqual(unprefixed.view_name, "inner:article")
+        self.assertEqual(unprefixed.kwargs, {"book": "blue", "pk": 1})
+        self.assertEqual(unprefixed.route, "loc/<slug:book>/article/<int:pk>/")
+        # The extra default-language prefix fails even while another language
+        # is active, and it never reaches an unprefixed sibling.
+        with self.assertRaises(Resolver404):
+            resolve("/en/loc/blue/article/1/", urlconf)
+        # A non-default language prefix still resolves no matter the active
+        # language; the unprefixed default mount does too.
+        with override("fr"):
+            other = resolve("/fr/loc/red/article/2/", urlconf)
+            default = resolve("/loc/blue/article/1/", urlconf)
+        self.assertEqual(other.view_name, "inner:article")
+        self.assertEqual(other.kwargs, {"book": "red", "pk": 2})
+        self.assertEqual(self._snapshot(default), self._snapshot(unprefixed))
+
+    @override_settings(LANGUAGE_CODE="en-us")
+    def test_unprefixed_regional_default_language(self):
+        urlconf = _temporary_i18n_urlconf(False)
+        # "en" is the supported variant of the "en-us" default language.
+        match = resolve("/loc/blue/article/1/", urlconf)
+        self.assertEqual(match.view_name, "inner:article")
+        for path in ("/en/loc/blue/article/1/", "/en-us/loc/blue/article/1/"):
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, urlconf)
+
+    def test_failure_then_success_is_unchanged(self):
+        urlconf = _temporary_i18n_urlconf(True)
+        baseline = self._snapshot(resolve("/plain/7/", urlconf))
+        for path in (
+            "/plain/not-an-int/",
+            "/xx/plain/7/",
+            "/en/loc/blue/article/not-an-int/",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, urlconf)
+        self.assertEqual(self._snapshot(resolve("/plain/7/", urlconf)), baseline)
+
+    def test_order_independence_and_stable_types(self):
+        urlconf = _temporary_i18n_urlconf(True)
+
+        def resolve_all():
+            legacy = resolve("/legacy/a%2Fb/", urlconf)
+            with override("fr"):
+                localized = resolve("/fr/loc/b/article/2/", urlconf)
+            plain = resolve("/plain/3/", urlconf)
+            return legacy, localized, plain
+
+        first = [self._snapshot(m) for m in resolve_all()]
+        second = [self._snapshot(m) for m in reversed(resolve_all())]
+        # Reversing the call order must not change any public result.
+        self.assertEqual(first, list(reversed(second)))
+        # A plain route keeps its trailing-slash rule and int kwargs even
+        # after language switches.
+        with self.assertRaises(Resolver404):
+            resolve("/plain/3", urlconf)
+        self.assertEqual(resolve("/plain/3/", urlconf).kwargs, {"pk": 3})
+        self.assertIsInstance(resolve("/plain/3/", urlconf).kwargs["pk"], int)
+
+    def test_plain_then_i18n_then_plain_identical(self):
+        urlconf = _temporary_i18n_urlconf(True)
+        before = resolve("/plain/5/", urlconf)
+        with override("fr"):
+            resolve("/fr/loc/b/article/5/", urlconf)
+        after = resolve("/plain/5/", urlconf)
+        self.assertEqual(self._snapshot(before), self._snapshot(after))

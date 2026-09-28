@@ -24,7 +24,11 @@ from django.utils.datastructures import MultiValueDict
 from django.utils.functional import cached_property
 from django.utils.http import RFC3986_SUBDELIMS, escape_leading_slashes
 from django.utils.regex_helper import _lazy_re_compile, normalize
-from django.utils.translation import get_language, get_supported_language_variant
+from django.utils.translation import (
+    get_language,
+    get_language_from_path,
+    get_supported_language_variant,
+)
 
 from .converters import get_converters
 from .exceptions import NoReverseMatch, Resolver404
@@ -108,6 +112,14 @@ class ResolverMatch:
 def get_resolver(urlconf=None):
     if urlconf is None:
         urlconf = settings.ROOT_URLCONF
+    try:
+        hash(urlconf)
+    except TypeError:
+        # An unhashable urlconf (a plain list/tuple of patterns handed in by
+        # the caller) is ephemeral: it cannot be used as a cache key and must
+        # not be shared with a later call that happens to pass an equal
+        # object. Build a dedicated resolver instead of caching it.
+        return URLResolver(RegexPattern(r"^/"), urlconf)
     return _get_cached_resolver(urlconf)
 
 
@@ -463,7 +475,15 @@ class RoutePattern(CheckURLMixin):
                             decoded
                         ):
                             return None
-                        kwargs[key] = converter.to_python(decoded)
+                        converted = converter.to_python(decoded)
+                        # A converter signals "no value" by raising; returning
+                        # None is not a valid captured parameter (an empty
+                        # capture is already rejected by the regex above), so
+                        # treat it as a non-match instead of handing None to
+                        # the view or letting it masquerade as a real kwarg.
+                        if converted is None:
+                            return None
+                        kwargs[key] = converted
                     except Exception:
                         return None
                 return path[match.end() :], (), kwargs
@@ -536,25 +556,37 @@ class LocalePrefixPattern:
             return "%s/" % language_code
 
     def match(self, path):
-        language_prefix = self.language_prefix
-        if path.startswith(language_prefix):
-            return path.removeprefix(language_prefix), (), {}
         # Resolution is driven by the requested path, not by the active
-        # language: a path carrying any supported language prefix must
-        # resolve identically no matter which language is active when
-        # resolve() is called. When prefix_default_language is False the
-        # default language is intentionally mounted without a prefix, so a
-        # prefixed request for it stays a non-match as before. Unknown
-        # prefixes (and unprefixed paths) likewise keep failing to match.
-        if self.prefix_default_language:
-            prefix, sep, rest = path.partition("/")
-            if sep:
+        # language: a path carrying a supported language prefix must resolve
+        # identically no matter which language is active when resolve() is
+        # called, and an unprefixed path must reach the default language
+        # mount regardless of it. get_language_from_path() validates the
+        # segment with the language-code regular expression, so a path such
+        # as "de-simple-page-test/" is never mistaken for a "de" prefix by
+        # variant fallback.
+        prefix, sep, rest = path.partition("/")
+        language = get_language_from_path("/" + path) if sep else None
+        if language is not None:
+            if not self.prefix_default_language:
+                # Compare against the supported variant of the default
+                # language so a regional default ("en-us" supported through
+                # "en") is recognized under either spelling; the default
+                # language is mounted without a prefix, so a prefixed
+                # request for it keeps failing here and cannot fall through
+                # to an unprefixed sibling.
                 try:
-                    get_supported_language_variant(prefix)
+                    default_language = get_supported_language_variant(
+                        settings.LANGUAGE_CODE
+                    ).lower()
                 except LookupError:
-                    pass
-                else:
-                    return rest, (), {}
+                    default_language = settings.LANGUAGE_CODE.lower()
+                if language.lower() == default_language:
+                    return None
+            return rest, (), {}
+        if not self.prefix_default_language:
+            # No language segment: this is the unprefixed default language
+            # mount even when another language happens to be active.
+            return path, (), {}
         return None
 
     def check(self):
@@ -833,6 +865,23 @@ class URLResolver:
         route2 = route2.removeprefix("^")
         return route1 + route2
 
+    @staticmethod
+    def _resolver_route(pattern, path):
+        """
+        The literal route a resolver pattern consumed from *path*.
+
+        A plain include's route is language-independent. A
+        LocalePrefixPattern renders the *active* language, which need not be
+        the prefix the requested path actually carried; reconstruct the
+        matched prefix from the path so ResolverMatch.route is identical no
+        matter which language is active when resolve() runs.
+        """
+        if isinstance(pattern.pattern, LocalePrefixPattern):
+            if get_language_from_path("/" + path) is not None:
+                return path.partition("/")[0] + "/"
+            return ""
+        return str(pattern.pattern)
+
     def _is_callback(self, name):
         if not self._populated:
             self._populate()
@@ -865,7 +914,7 @@ class URLResolver:
                         current_route = (
                             ""
                             if isinstance(pattern, URLPattern)
-                            else str(pattern.pattern)
+                            else self._resolver_route(pattern, new_path)
                         )
                         self._extend_tried(tried, pattern, sub_match.tried)
                         return ResolverMatch(
