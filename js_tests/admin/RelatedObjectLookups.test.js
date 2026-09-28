@@ -7,6 +7,8 @@ QUnit.module("admin.RelatedObjectLookups", {
         $("#qunit-fixture").append(`
             <input type="text" id="test_id" name="test" />
             <input type="text" id="many_test_id" name="many_test" class="vManyToManyRawIdAdminField" />
+            <input type="text" id="composite_test_id" name="composite_test"
+                class="vManyToManyRawIdAdminField" data-composite-pk="1" />
         `);
     },
 });
@@ -90,6 +92,33 @@ QUnit.test(
                 this.value,
                 existingValue + "," + newValue,
                 "Value should be appended for many-to-many fields",
+            );
+        });
+        window.dismissRelatedLookupPopup(mockWin, newValue);
+        assert.true(changeTriggered, "Change event should be triggered");
+    },
+);
+
+QUnit.test(
+    "dismissRelatedLookupPopup joins composite keys with a tab",
+    function (assert) {
+        assert.timeout(1000);
+        const $ = django.jQuery;
+        const testId = "composite_test_id";
+        const existingValue = '["1", "a,b"]';
+        const newValue = '["2", "c"]';
+        $("#" + testId).val(existingValue);
+        const mockWin = {
+            name: testId,
+            close: function () {},
+        };
+        let changeTriggered = false;
+        $("#" + testId).on("change", function () {
+            changeTriggered = true;
+            assert.equal(
+                this.value,
+                existingValue + "\t" + newValue,
+                "Composite keys must be tab-separated, not comma-separated",
             );
         });
         window.dismissRelatedLookupPopup(mockWin, newValue);

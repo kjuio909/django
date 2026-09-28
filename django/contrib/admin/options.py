@@ -1005,13 +1005,35 @@ class ModelAdmin(BaseModelAdmin):
         return field.to_python(object_id)
 
     def unquote(self, object_id, to_field=None):
-        """Undo quote() on an object_id, splitting a composite key into parts."""
+        """Undo quote() on an object_id, splitting a composite key into
+        parts."""
         if self.opts.is_composite_pk and to_field is None:
             return tuple(
                 None if part == COMPOSITE_PK_NULL else unquote(part)
                 for part in split_parts(object_id)
             )
         return unquote(object_id)
+
+    def _popup_targets_m2m(self, request):
+        """
+        Return whether this popup was opened from a many-to-many field of the
+        model named by SOURCE_MODEL_VAR. Such fields identify their targets by
+        the full composite primary key, so the popup callback value must use
+        the form field's key encoding rather than the URL quoting.
+        """
+        source_model_name = request.POST.get(SOURCE_MODEL_VAR)
+        if not source_model_name:
+            return False
+        try:
+            app_label, model_name = source_model_name.split(".", 1)
+            source_model = apps.get_model(app_label, model_name)
+        except (LookupError, ValueError):
+            return False
+        target_concrete_model = self.model._meta.concrete_model
+        return any(
+            field.remote_field.model._meta.concrete_model is target_concrete_model
+            for field in source_model._meta.many_to_many
+        )
 
     def get_changelist_form(self, request, **kwargs):
         """
@@ -1653,6 +1675,11 @@ class ModelAdmin(BaseModelAdmin):
             if to_field:
                 attr = str(to_field)
                 value = obj.serializable_value(attr)
+            elif self.opts.is_composite_pk and self._popup_targets_m2m(request):
+                # The opener is a many-to-many form field whose options carry
+                # the key encoded by CompositePrimaryKey.value_to_string();
+                # return the same encoding so the popup callback can select it.
+                value = self.opts.pk.value_to_string(obj)
             elif self.opts.is_composite_pk:
                 value = quote(obj.pk)
             else:
@@ -1765,7 +1792,13 @@ class ModelAdmin(BaseModelAdmin):
             to_field = request.POST.get(TO_FIELD_VAR)
             attr = str(to_field) if to_field else opts.pk.attname
             value = request.resolver_match.kwargs["object_id"]
-            if opts.is_composite_pk:
+            if (
+                opts.is_composite_pk
+                and not to_field
+                and self._popup_targets_m2m(request)
+            ):
+                new_value = opts.pk.value_to_string(obj)
+            elif opts.is_composite_pk:
                 new_value = quote(obj.pk)
             else:
                 new_value = obj.serializable_value(attr)
@@ -2568,6 +2601,7 @@ class ModelAdmin(BaseModelAdmin):
             "subtitle": None,
             "is_popup": cl.is_popup,
             "to_field": cl.to_field,
+            "source_model": request.GET.get(SOURCE_MODEL_VAR),
             "cl": cl,
             "media": media,
             "has_add_permission": self.has_add_permission(request),

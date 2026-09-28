@@ -4,6 +4,7 @@ Form Widget classes specific to the Django admin site.
 
 import copy
 import json
+import re
 
 from django import forms
 from django.conf import settings
@@ -244,21 +245,50 @@ class ManyToManyRawIdWidget(ForeignKeyRawIdWidget):
         if self.admin_site.is_registered(self.rel.model):
             # The related object is registered with the same AdminSite
             context["widget"]["attrs"]["class"] = "vManyToManyRawIdAdminField"
+            if self.rel.model._meta.is_composite_pk:
+                # Encoded composite primary keys may contain commas, so the
+                # lookup/add popups join them with a tab instead.
+                context["widget"]["attrs"]["data-composite-pk"] = "1"
         return context
 
     def url_parameters(self):
-        return self.base_url_parameters()
+        from django.contrib.admin.views.main import SOURCE_MODEL_VAR
+
+        params = self.base_url_parameters()
+        if self.rel.model._meta.is_composite_pk:
+            # The add link inside the lookup popup must answer with the form
+            # field's key encoding; that requires knowing the opener model.
+            opts = self.rel.field.model._meta
+            params[SOURCE_MODEL_VAR] = "%s.%s" % (opts.app_label, opts.model_name)
+        return params
 
     def label_and_url_for_value(self, value):
         return "", ""
 
+    @property
+    def composite_pk(self):
+        return self.rel.model._meta.is_composite_pk
+
     def value_from_datadict(self, data, files, name):
         value = data.get(name)
         if value:
+            if self.composite_pk:
+                # Tabs (also accepted: newlines) separate encoded composite
+                # primary keys; the JSON values themselves may contain commas,
+                # so commas are never separators here.
+                return [
+                    part
+                    for part in (part.strip() for part in re.split(r"[\t\n\r]+", value))
+                    if part
+                ]
             return value.split(",")
 
     def format_value(self, value):
-        return ",".join(str(v) for v in value) if value else ""
+        if not value:
+            return ""
+        if self.composite_pk:
+            return "\t".join(str(v) for v in value)
+        return ",".join(str(v) for v in value)
 
 
 class RelatedFieldWidgetWrapper(forms.Widget):
@@ -343,18 +373,23 @@ class RelatedFieldWidgetWrapper(forms.Widget):
 
         rel_opts = self.rel.model._meta
         info = (rel_opts.app_label, rel_opts.model_name)
+        # Relations to a model with a composite primary key always target the
+        # key as a whole: the form field encodes it with the key's own
+        # value_to_string() rather than any single component, so the popup and
+        # lookup URLs must not carry a _to_field parameter (which would point
+        # at just one component).
+        is_composite_pk = rel_opts.is_composite_pk
         related_field_name = self.rel.get_related_field().name
         app_label = self.rel.field.model._meta.app_label
         model_name = self.rel.field.model._meta.model_name
 
-        url_params = "&".join(
-            "%s=%s" % param
-            for param in [
-                (TO_FIELD_VAR, related_field_name),
-                (IS_POPUP_VAR, 1),
-                (SOURCE_MODEL_VAR, f"{app_label}.{model_name}"),
-            ]
-        )
+        params = [
+            (IS_POPUP_VAR, 1),
+            (SOURCE_MODEL_VAR, f"{app_label}.{model_name}"),
+        ]
+        if not is_composite_pk:
+            params.insert(0, (TO_FIELD_VAR, related_field_name))
+        url_params = "&".join("%s=%s" % param for param in params)
         context = {
             "rendered_widget": self.widget.render(name, value, attrs),
             "is_hidden": self.is_hidden,
@@ -580,12 +615,40 @@ class AutocompleteMixin:
             self.field.remote_field, "field_name", remote_model_opts.pk.attname
         )
         to_field_name = remote_model_opts.get_field(to_field_name).attname
-        choices = (
-            (getattr(obj, to_field_name), self.choices.field.label_from_instance(obj))
-            for obj in self.choices.queryset.using(self.db).filter(
-                **{"%s__in" % to_field_name: selected_choices}
-            )
+        composite_pk = (
+            remote_model_opts.pk if remote_model_opts.is_composite_pk else None
         )
+        if composite_pk is not None and to_field_name == composite_pk.attname:
+            # Selected values are composite primary keys encoded by the form
+            # field; decode them for the lookup and encode each option back.
+            lookup_values = []
+            for selected in selected_choices:
+                try:
+                    lookup_values.append(tuple(composite_pk.to_python(selected)))
+                except (ValueError, TypeError, OverflowError):
+                    # Malformed values are rejected by the field's validation;
+                    # they simply don't render as a preselected option.
+                    continue
+            objects = self.choices.queryset.using(self.db).filter(
+                **{"%s__in" % to_field_name: lookup_values}
+            )
+            choices = (
+                (
+                    composite_pk.value_to_string(obj.pk),
+                    self.choices.field.label_from_instance(obj),
+                )
+                for obj in objects
+            )
+        else:
+            choices = (
+                (
+                    getattr(obj, to_field_name),
+                    self.choices.field.label_from_instance(obj),
+                )
+                for obj in self.choices.queryset.using(self.db).filter(
+                    **{"%s__in" % to_field_name: selected_choices}
+                )
+            )
         for option_value, option_label in choices:
             selected = str(option_value) in value and (
                 has_selected is False or self.allow_multiple_selected

@@ -283,6 +283,11 @@ def items_for_result(cl, result, form):
                 else:
                     attr = pk
                 value = result.serializable_value(attr)
+                # A composite primary key is a tuple; form fields encode it
+                # with value_to_string(), so the popup opener must use that
+                # same encoding (rather than its Python repr).
+                if cl.is_popup and not cl.to_field and cl.opts.is_composite_pk:
+                    value = cl.opts.pk.value_to_string(value)
                 link_or_text = format_html(
                     '<a href="{}"{}>{}</a>',
                     url,

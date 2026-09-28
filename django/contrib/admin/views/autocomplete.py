@@ -47,7 +47,13 @@ class AutocompleteJsonView(BaseListView):
         Convert the provided model object to a dictionary that is added to the
         results list.
         """
-        return {"id": str(getattr(obj, to_field_name)), "text": str(obj)}
+        if to_field_name == obj._meta.pk.attname and obj._meta.is_composite_pk:
+            # The autocomplete widget's option values are composite primary
+            # keys encoded by the form field; emit the same encoding.
+            value = obj._meta.pk.value_to_string(obj)
+        else:
+            value = str(getattr(obj, to_field_name))
+        return {"id": value, "text": str(obj)}
 
     def get_paginator(self, *args, **kwargs):
         """Use the ModelAdmin's paginator."""

@@ -63,6 +63,14 @@ def add_preserved_filters(context, url, popup=False, to_field=None):
         from django.contrib.admin.options import TO_FIELD_VAR
 
         merged_qs[TO_FIELD_VAR] = to_field
+    if popup:
+        # Keep the opener model so the popup response can encode composite
+        # primary keys the same way the originating form field does.
+        from django.contrib.admin.options import SOURCE_MODEL_VAR
+
+        source_model = context.get("source_model")
+        if source_model:
+            merged_qs[SOURCE_MODEL_VAR] = source_model
 
     merged_qs.update(parsed_qs)
 

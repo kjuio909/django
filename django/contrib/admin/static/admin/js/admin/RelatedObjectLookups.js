@@ -53,6 +53,20 @@
         return showAdminPopup(triggeringLink, /^lookup_/, true);
     }
 
+    function rawIdSeparator(elem) {
+        // Composite primary keys are JSON arrays that may contain commas;
+        // their raw-id fields are flagged and use a tab separator.
+        return elem.dataset.compositePk === "1" ? "\t" : ",";
+    }
+
+    function appendRawIdValue(elem, chosenId) {
+        if (elem.value) {
+            elem.value += rawIdSeparator(elem) + chosenId;
+        } else {
+            elem.value = chosenId;
+        }
+    }
+
     function dismissRelatedLookupPopup(win, chosenId) {
         const name = removePopupIndex(win.name);
         const elem = document.getElementById(name);
@@ -60,7 +74,7 @@
             elem.classList.contains("vManyToManyRawIdAdminField") &&
             elem.value
         ) {
-            elem.value += "," + chosenId;
+            appendRawIdValue(elem, chosenId);
         } else {
             elem.value = chosenId;
         }
@@ -130,7 +144,12 @@
                 return;
             }
 
-            let option = select.querySelector(`option[value="${objId}"]`);
+            // Match by value directly: option values may be encoded composite
+            // primary keys containing quotes, brackets or backslashes, which
+            // cannot be safely embedded in a CSS attribute selector.
+            let option = Array.from(select.options).find(
+                (existing) => existing.value === objId,
+            );
 
             if (!option) {
                 option = new Option(newRepr, newId);
@@ -175,7 +194,7 @@
                     elem.classList.contains("vManyToManyRawIdAdminField") &&
                     elem.value
                 ) {
-                    elem.value += "," + newId;
+                    appendRawIdValue(elem, newId);
                 } else {
                     elem.value = newId;
                 }
