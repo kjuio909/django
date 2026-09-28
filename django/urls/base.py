@@ -9,7 +9,11 @@ from django.utils.functional import Promise, lazy
 from django.utils.translation import override
 
 from .exceptions import NoReverseMatch, Resolver404
-from .resolvers import _get_cached_resolver, get_ns_resolver, get_resolver
+from .resolvers import (
+    _resolver_cache,
+    get_ns_resolver,
+    get_resolver,
+)
 from .utils import get_callable
 
 # SCRIPT_NAME prefixes for each thread are stored here. If there's no entry for
@@ -232,7 +236,10 @@ def reverse(
                     raise NoReverseMatch("%s is not a registered namespace" % key)
         if ns_pattern:
             resolver = get_ns_resolver(
-                ns_pattern, resolver, tuple(ns_converters.items())
+                ns_pattern,
+                resolver,
+                tuple(ns_converters.items()),
+                resolver.patterns_version,
             )
 
     resolved_url = resolver._reverse_with_prefix(
@@ -252,7 +259,7 @@ reverse_lazy = lazy(reverse, str)
 
 def clear_url_caches():
     get_callable.cache_clear()
-    _get_cached_resolver.cache_clear()
+    _resolver_cache.clear()
     get_ns_resolver.cache_clear()
 
 

@@ -10,6 +10,7 @@ import functools
 import inspect
 import re
 import string
+import sys
 from importlib import import_module
 from pickle import PicklingError
 from urllib.parse import quote, unquote
@@ -112,6 +113,18 @@ class ResolverMatch:
 def get_resolver(urlconf=None):
     if urlconf is None:
         urlconf = settings.ROOT_URLCONF
+    return _get_cached_resolver(urlconf)
+
+
+# One resolver per urlconf. The resolver is long-lived and version-aware: it
+# reloads its patterns itself when the urlconf's ``urlpatterns`` is replaced
+# (a *refresh*), so an explicit urlconf handed to resolve() observes the
+# replacement without the caller clearing any cache, and a refresh onto an
+# invalid table cannot destroy the resolver's previously working table.
+_resolver_cache: dict = {}
+
+
+def _get_cached_resolver(urlconf=None):
     try:
         hash(urlconf)
     except TypeError:
@@ -120,22 +133,64 @@ def get_resolver(urlconf=None):
         # not be shared with a later call that happens to pass an equal
         # object. Build a dedicated resolver instead of caching it.
         return URLResolver(RegexPattern(r"^/"), urlconf)
-    return _get_cached_resolver(urlconf)
+    try:
+        return _resolver_cache[urlconf]
+    except KeyError:
+        resolver = URLResolver(RegexPattern(r"^/"), urlconf)
+        _resolver_cache[urlconf] = resolver
+        return resolver
+
+
+def _patterns_of(urlconf_name):
+    """Return the pattern list referenced by a resolver's urlconf_name."""
+    if isinstance(urlconf_name, str):
+        urlconf_module = import_module(urlconf_name)
+    else:
+        urlconf_module = urlconf_name
+    return getattr(urlconf_module, "urlpatterns", urlconf_module)
+
+
+def _validate_patterns(patterns, urlconf_name):
+    """
+    Validate a candidate routing table before it replaces a working one.
+
+    Every entry must be a pattern with a compilable regex; nested include()
+    tables are read directly so validation never mutates a (possibly shared)
+    child resolver's cache. Any failure raises -- usually
+    ImproperlyConfigured -- and leaves the caller's currently loaded table
+    untouched.
+    """
+    for url_pattern in patterns:
+        if not isinstance(url_pattern, (URLPattern, URLResolver)):
+            raise ImproperlyConfigured(
+                "The URLconf %r contains an entry that is not a valid URL "
+                "pattern: %r" % (urlconf_name, url_pattern)
+            )
+        # Accessing regex compiles it, so an invalid regular expression fails
+        # the refresh rather than the first request reaching the pattern.
+        _ = url_pattern.pattern.regex
+        if isinstance(url_pattern, URLResolver):
+            try:
+                nested = list(_patterns_of(url_pattern.urlconf_name))
+            except TypeError as e:
+                raise ImproperlyConfigured(
+                    "The included URLconf '%s' does not appear to have any "
+                    "patterns in it." % url_pattern.urlconf_name
+                ) from e
+            _validate_patterns(nested, url_pattern.urlconf_name)
 
 
 @functools.cache
-def _get_cached_resolver(urlconf=None):
-    return URLResolver(RegexPattern(r"^/"), urlconf)
-
-
-@functools.cache
-def get_ns_resolver(ns_pattern, resolver, converters):
+def get_ns_resolver(ns_pattern, resolver, converters, patterns_version):
     # Build a namespaced resolver for the given parent URLconf pattern.
     # This makes it possible to have captured parameters in the parent
-    # URLconf pattern.
+    # URLconf pattern. patterns_version identifies the parent's currently
+    # loaded routing table: a refresh replaces the table and the cached
+    # resolver built from the old one is simply not reused.
     pattern = RegexPattern(ns_pattern)
     pattern.converters = dict(converters)
-    ns_resolver = URLResolver(pattern, resolver.url_patterns)
+    url_patterns = resolver.url_patterns
+    ns_resolver = URLResolver(pattern, url_patterns)
     return URLResolver(RegexPattern(r"^/"), [ns_resolver])
 
 
@@ -725,6 +780,18 @@ class URLResolver:
         self._callback_strs = set()
         self._populated = False
         self._local = Local()
+        # The routing table currently loaded. ``_loaded_patterns_ref`` is the
+        # exact object the urlconf exposes as ``urlpatterns`` (kept for an
+        # identity comparison: because it is held, its id can never be reused
+        # by a replacement), and ``_loaded_url_patterns`` is the materialized
+        # list walked by resolve(). _patterns_generation advances on every
+        # committed refresh and versions derived caches. See
+        # _reload_patterns().
+        self._loaded = False
+        self._loaded_urlconf_module = None
+        self._loaded_patterns_ref = None
+        self._loaded_url_patterns = None
+        self._patterns_generation = 0
 
     def __repr__(self):
         if isinstance(self.urlconf_name, list) and self.urlconf_name:
@@ -855,6 +922,10 @@ class URLResolver:
 
     @property
     def reverse_dict(self):
+        # Pick up a replaced urlpatterns before reading a cache derived from
+        # the patterns; a refresh clears these lookups (see
+        # _reload_patterns()).
+        self._reload_patterns()
         language_code = get_language()
         if language_code not in self._reverse_dict:
             self._populate()
@@ -862,6 +933,7 @@ class URLResolver:
 
     @property
     def namespace_dict(self):
+        self._reload_patterns()
         language_code = get_language()
         if language_code not in self._namespace_dict:
             self._populate()
@@ -869,6 +941,7 @@ class URLResolver:
 
     @property
     def app_dict(self):
+        self._reload_patterns()
         language_code = get_language()
         if language_code not in self._app_dict:
             self._populate()
@@ -960,28 +1033,132 @@ class URLResolver:
             raise Resolver404({"tried": tried, "path": new_path})
         raise Resolver404({"path": path})
 
-    @cached_property
-    def urlconf_module(self):
+    def _current_patterns(self):
+        """
+        Return ``(urlconf_module, patterns_ref)`` for the routing table the
+        urlconf currently exposes. *patterns_ref* is the raw (not yet
+        materialized) object found under ``urlpatterns`` -- or the urlconf
+        itself when it is the pattern container.
+        """
         if isinstance(self.urlconf_name, str):
-            return import_module(self.urlconf_name)
+            urlconf_module = import_module(self.urlconf_name)
         else:
-            return self.urlconf_name
+            urlconf_module = self.urlconf_name
+        return urlconf_module, getattr(
+            urlconf_module, "urlpatterns", urlconf_module
+        )
 
-    @cached_property
+    def _exposed_patterns_ref(self):
+        """
+        Like the second item of _current_patterns(), but never imports:
+        return None for a dotted path whose module is not loaded yet.
+        """
+        if isinstance(self.urlconf_name, str):
+            module = sys.modules.get(self.urlconf_name)
+            if module is None:
+                return None
+            return getattr(module, "urlpatterns", module)
+        return getattr(self.urlconf_name, "urlpatterns", self.urlconf_name)
+
+    def _reload_patterns(self):
+        """
+        Make sure the cached urlconf module and its urlpatterns reflect the
+        urlconf's current routing table.
+
+        A caller-supplied urlconf may replace its ``urlpatterns`` at runtime
+        (an observable configuration refresh). The currently exposed table is
+        compared by identity with the one held here; a different object means
+        it has been replaced. Identity -- rather than ``id()`` -- is what
+        matters because the held reference keeps the old object alive, so its
+        address can never be reused by a replacement. On refresh the patterns
+        and every cache derived from them (reverse lookups, namespaces and
+        callback strings) are rebuilt from the new table on demand, without
+        the caller clearing any cache.
+
+        A refresh onto a table that fails to load is never committed: it
+        cannot leave a half-installed table, the previously working table
+        stays available, and the next replacement (e.g. after the table is
+        fixed) takes effect immediately.
+
+        As historically, a urlpatterns that is itself a reusable sequence (a
+        list or tuple, the normal case) is held by reference, so an in-place
+        change such as ``urlpatterns.append(...)`` stays visible to resolve();
+        assigning a new ``urlpatterns`` object is a refresh that also rebuilds
+        the reverse/namespace lookups. A one-shot iterable (a generator) is
+        snapshotted once.
+        """
+        # Hot path: if the table currently exposed is, by identity, the one
+        # already loaded, there is nothing to do. A held list/tuple is read
+        # by reference, so in-place changes are already visible. This also
+        # avoids an import_module() lookup on every resolve().
+        if self._loaded:
+            current_ref = self._exposed_patterns_ref()
+            if current_ref is not None and current_ref is self._loaded_patterns_ref:
+                return
+        urlconf_module, patterns_ref = self._current_patterns()
+        if self._loaded and patterns_ref is self._loaded_patterns_ref:
+            return
+        if isinstance(patterns_ref, (list, tuple)):
+            # Hold the real sequence so an in-place edit remains visible,
+            # matching the historical cached list.
+            new_patterns = patterns_ref
+        else:
+            try:
+                # Materialize a one-shot iterable (a generator) once so it
+                # can be walked repeatedly -- by resolve(), checks and reverse
+                # lookups alike -- always reflecting this same table.
+                new_patterns = list(patterns_ref)
+            except TypeError as e:
+                msg = (
+                    "The included URLconf '{name}' does not appear to have "
+                    "any patterns in it. If you see the 'urlpatterns' "
+                    "variable with valid patterns in the file then the issue "
+                    "is probably caused by a circular import."
+                )
+                # Nothing has been committed yet, so the previously cached
+                # patterns stay in place and a still-valid old table keeps
+                # resolving.
+                raise ImproperlyConfigured(
+                    msg.format(name=self.urlconf_name)
+                ) from e
+        if self._loaded:
+            # A refresh replaces a table that still works. Validate the whole
+            # candidate -- including nested includes -- before committing it,
+            # so an invalid replacement fails the call while the previously
+            # working table is left completely intact. Nested tables are read
+            # directly, so a (possibly shared) child resolver is never touched.
+            # An initial load keeps its historical, lazy behavior (an unusable
+            # pattern only fails the request that reaches it).
+            _validate_patterns(new_patterns, self.urlconf_name)
+        # Commit the refresh only once the new table has loaded successfully.
+        self._loaded_urlconf_module = urlconf_module
+        self._loaded_patterns_ref = patterns_ref
+        self._loaded_url_patterns = new_patterns
+        self._patterns_generation += 1
+        self._reverse_dict = {}
+        self._namespace_dict = {}
+        self._app_dict = {}
+        self._callback_strs = set()
+        self._populated = False
+        self._loaded = True
+
+    @property
+    def urlconf_module(self):
+        self._reload_patterns()
+        return self._loaded_urlconf_module
+
+    @property
     def url_patterns(self):
-        # urlconf_module might be a valid set of patterns, so we default to it
-        patterns = getattr(self.urlconf_module, "urlpatterns", self.urlconf_module)
-        try:
-            iter(patterns)
-        except TypeError as e:
-            msg = (
-                "The included URLconf '{name}' does not appear to have "
-                "any patterns in it. If you see the 'urlpatterns' variable "
-                "with valid patterns in the file then the issue is probably "
-                "caused by a circular import."
-            )
-            raise ImproperlyConfigured(msg.format(name=self.urlconf_name)) from e
-        return patterns
+        self._reload_patterns()
+        return self._loaded_url_patterns
+
+    @property
+    def patterns_version(self):
+        # Identifies the routing table currently loaded; advances on every
+        # committed refresh. Used to key derived caches (see
+        # get_ns_resolver()).
+        self._reload_patterns()
+        return self._patterns_generation
 
     def resolve_error_handler(self, view_type):
         callback = getattr(self.urlconf_module, "handler%s" % view_type, None)

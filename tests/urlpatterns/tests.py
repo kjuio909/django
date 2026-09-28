@@ -17,7 +17,7 @@ from django.urls import (
     reverse,
 )
 from django.urls.converters import REGISTERED_CONVERTERS, IntConverter, get_converters
-from django.urls.resolvers import _route_to_regex
+from django.urls.resolvers import _route_to_regex, get_resolver
 from django.utils.translation import override
 from django.views import View
 
@@ -1236,4 +1236,273 @@ class QueryFragmentTerminalCaptureResolveTests(SimpleTestCase):
         with self.assertRaises(Resolver404):
             resolve("/legacy/9/#f", self.urlconf)
         self.assertEqual(resolve("/legacy/9/", self.urlconf).kwargs, {"oid": "9"})
+
+
+def refresh_view_one(request):
+    raise NotImplementedError
+
+
+def refresh_view_two(request):
+    raise NotImplementedError
+
+
+class _RefreshableURLConf:
+    """A plain urlconf object whose urlpatterns can be replaced at runtime."""
+
+    def __init__(self, urlpatterns):
+        self.urlpatterns = urlpatterns
+
+
+def _old_patterns():
+    return [
+        path("old/<int:pk>/", refresh_view_one, name="old"),
+        re_path(r"^legacy/(?P<rest>.+)/$", refresh_view_one, name="legacy"),
+    ]
+
+
+def _new_nested_patterns():
+    # Two levels of include() with application namespaces, a trailing slash
+    # and a typed converter on the include prefix as well as the endpoint.
+    inner_urlpatterns = [
+        path("article/<int:article_id>/", refresh_view_two, name="article"),
+    ]
+    middle_urlpatterns = [
+        path(
+            "sec/<slug:section>/",
+            include((inner_urlpatterns, "inner"), namespace="inner"),
+        ),
+    ]
+    return [
+        path(
+            "org/<int:org>/",
+            include((middle_urlpatterns, "mid"), namespace="mid"),
+        ),
+    ]
+
+
+def _match_snapshot(match):
+    return (
+        match.func,
+        match.view_name,
+        match.url_name,
+        match.args,
+        dict(match.kwargs),
+        {key: type(value) for key, value in match.kwargs.items()},
+        list(match.app_names),
+        list(match.namespaces),
+        match.route,
+        dict(match.captured_kwargs),
+        dict(match.extra_kwargs),
+    )
+
+
+class RuntimeURLConfRefreshTests(SimpleTestCase):
+    """
+    resolve(path, urlconf=...) must observe a urlpatterns table replaced on
+    the very urlconf object the caller passes in -- without the caller
+    clearing an internal cache -- while failures, other urlconfs and legacy
+    routes never leak state into a later successful match.
+    """
+
+    def setUp(self):
+        self.urlconf = _RefreshableURLConf(_old_patterns())
+
+    def test_replacement_is_observed_without_clearing_cache(self):
+        match = resolve("/old/42/", self.urlconf)
+        self.assertIs(match.func, refresh_view_one)
+        self.assertEqual(match.view_name, "old")
+        self.assertEqual(match.kwargs, {"pk": 42})
+
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        match = resolve("/org/12/sec/news/article/7/", self.urlconf)
+        # The new table provides the new view, namespace chain and captures.
+        self.assertIs(match.func, refresh_view_two)
+        self.assertEqual(match.view_name, "mid:inner:article")
+        self.assertEqual(match.url_name, "article")
+        self.assertEqual(match.namespaces, ["mid", "inner"])
+        self.assertEqual(match.app_names, ["mid", "inner"])
+        self.assertEqual(match.kwargs, {"org": 12, "section": "news", "article_id": 7})
+        # Include prefixes are not endpoint captures and never duplicated.
+        self.assertEqual(match.captured_kwargs, {"article_id": 7})
+        self.assertEqual(
+            match.route,
+            "org/<int:org>/sec/<slug:section>/article/<int:article_id>/",
+        )
+        # The previous route is gone immediately.
+        with self.assertRaises(Resolver404):
+            resolve("/old/42/", self.urlconf)
+
+    def test_types_and_single_decoding_after_refresh(self):
+        self.urlconf.urlpatterns = [
+            path("num/<int:value>/", refresh_view_two, name="num"),
+            path("word/<str:word>/", refresh_view_one, name="word"),
+        ]
+        match = resolve("/num/%33%37/", self.urlconf)
+        self.assertEqual(match.kwargs, {"value": 37})
+        self.assertIsInstance(match.kwargs["value"], int)
+        # A double-encoded value decodes once into the literal escape text.
+        match = resolve("/word/%2537/", self.urlconf)
+        self.assertEqual(match.kwargs, {"word": "%37"})
+
+    def test_failures_report_resolver404_and_do_not_pollute(self):
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        # A missing/extra segment and a converter-rejecting value all 404.
+        for url in (
+            "/org/12/sec/news/",
+            "/org/12/sec/news/article/7/extra/",
+            "/org/12/sec/news/article/not-an-int/",
+            "/org/not-an-int/sec/news/article/7/",
+            "/org/12/sec/a%20b/article/7/",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(Resolver404):
+                    resolve(url, self.urlconf)
+        # A following success carries no trace of the failed attempts.
+        match = resolve("/org/12/sec/news/article/7/", self.urlconf)
+        self.assertEqual(match.namespaces, ["mid", "inner"])
+        self.assertEqual(match.app_names, ["mid", "inner"])
+        self.assertEqual(match.kwargs, {"org": 12, "section": "news", "article_id": 7})
+        self.assertEqual(match.captured_kwargs, {"article_id": 7})
+
+    def test_resolve_nonexistent_path_then_refresh(self):
+        with self.assertRaises(Resolver404):
+            resolve("/does/not/exist/", self.urlconf)
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        match = resolve("/org/3/sec/tech/article/9/", self.urlconf)
+        self.assertEqual(match.view_name, "mid:inner:article")
+        self.assertEqual(match.kwargs, {"org": 3, "section": "tech", "article_id": 9})
+
+    def test_refresh_then_old_path_does_not_leak_namespace_or_kwargs(self):
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        resolve("/org/1/sec/a/article/1/", self.urlconf)
+        self.urlconf.urlpatterns = [
+            path("plain/<int:pk>/", refresh_view_one, name="plain"),
+        ]
+        match = resolve("/plain/5/", self.urlconf)
+        self.assertEqual(match.view_name, "plain")
+        self.assertEqual(match.namespaces, [])
+        self.assertEqual(match.app_names, [])
+        self.assertEqual(match.kwargs, {"pk": 5})
+        self.assertEqual(match.captured_kwargs, {"pk": 5})
+        with self.assertRaises(Resolver404):
+            resolve("/org/1/sec/a/article/1/", self.urlconf)
+
+    def test_two_urlconfs_alternate_without_cross_contamination(self):
+        other = _RefreshableURLConf(
+            [path("other/<int:x>/", refresh_view_two, name="other")]
+        )
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        first = resolve("/org/1/sec/a/article/1/", self.urlconf)
+        second = resolve("/other/2/", other)
+        third = resolve("/org/4/sec/b/article/3/", self.urlconf)
+        fourth = resolve("/other/5/", other)
+        self.assertEqual(first.namespaces, ["mid", "inner"])
+        self.assertEqual(second.namespaces, [])
+        self.assertEqual(third.namespaces, ["mid", "inner"])
+        self.assertEqual(fourth.namespaces, [])
+        self.assertEqual(second.kwargs, {"x": 2})
+        self.assertEqual(third.kwargs, {"org": 4, "section": "b", "article_id": 3})
+        self.assertEqual(fourth.kwargs, {"x": 5})
+
+    def test_unrefreshed_urlconf_is_unchanged(self):
+        stable = _RefreshableURLConf(
+            [path("stable/<int:pk>/", refresh_view_two, name="stable")]
+        )
+        resolve("/stable/1/", stable)
+        # Replacing the first urlconf repeatedly never touches the second.
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        resolve("/org/1/sec/a/article/1/", self.urlconf)
+        self.urlconf.urlpatterns = [path("x/", refresh_view_one)]
+        match = resolve("/stable/2/", stable)
+        self.assertIs(match.func, refresh_view_two)
+        self.assertEqual(match.view_name, "stable")
+        self.assertEqual(match.kwargs, {"pk": 2})
+
+    def test_invalid_replacement_keeps_previous_table_until_fixed(self):
+        resolve("/old/1/", self.urlconf)
+        # An entry that is not a pattern cannot replace the working table.
+        self.urlconf.urlpatterns = [object()]
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/old/1/", self.urlconf)
+        # An uncompilable regex likewise fails without committing.
+        self.urlconf.urlpatterns = [re_path(r"[", refresh_view_two, name="bad")]
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/old/1/", self.urlconf)
+        # Fixing the table gives the complete new result immediately.
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        match = resolve("/org/7/sec/news/article/8/", self.urlconf)
+        self.assertEqual(match.view_name, "mid:inner:article")
+        self.assertEqual(match.kwargs, {"org": 7, "section": "news", "article_id": 8})
+        with self.assertRaises(Resolver404):
+            resolve("/old/1/", self.urlconf)
+
+    def test_repeated_equivalent_replacements_are_comparable(self):
+        table = [path("plain/<int:pk>/", refresh_view_one, name="plain")]
+        self.urlconf.urlpatterns = table
+        baseline = _match_snapshot(resolve("/plain/9/", self.urlconf))
+        for _ in range(3):
+            self.urlconf.urlpatterns = [
+                path("plain/<int:pk>/", refresh_view_one, name="plain")
+            ]
+            self.assertEqual(
+                _match_snapshot(resolve("/plain/9/", self.urlconf)), baseline
+            )
+
+    def test_legacy_re_path_keeps_raw_match_after_refresh(self):
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        resolve("/org/1/sec/a/article/1/", self.urlconf)
+        self.urlconf.urlpatterns = _old_patterns()
+        match = resolve("/legacy/a%2Fb/", self.urlconf)
+        self.assertEqual(match.view_name, "legacy")
+        self.assertEqual(match.namespaces, [])
+        self.assertEqual(match.app_names, [])
+        # re_path() captures stay raw and undecoded.
+        self.assertEqual(match.kwargs, {"rest": "a%2Fb"})
+        with self.assertRaises(Resolver404):
+            resolve("/org/1/sec/a/article/1/", self.urlconf)
+
+    def test_reverse_observes_refresh(self):
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        self.assertEqual(
+            reverse(
+                "mid:inner:article",
+                kwargs={"org": 1, "section": "a", "article_id": 2},
+                urlconf=self.urlconf,
+            ),
+            "/org/1/sec/a/article/2/",
+        )
+        self.urlconf.urlpatterns = [
+            path("plain/<int:pk>/", refresh_view_one, name="plain"),
+        ]
+        self.assertEqual(
+            reverse("plain", kwargs={"pk": 5}, urlconf=self.urlconf), "/plain/5/"
+        )
+        with self.assertRaises(NoReverseMatch):
+            reverse(
+                "mid:inner:article",
+                kwargs={"org": 1, "section": "a", "article_id": 2},
+                urlconf=self.urlconf,
+            )
+
+    def test_resolver_identity_is_stable_across_refresh(self):
+        first = get_resolver(self.urlconf)
+        resolve("/old/1/", self.urlconf)
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        resolve("/org/1/sec/a/article/1/", self.urlconf)
+        # The same long-lived resolver now serves the new table.
+        self.assertIs(get_resolver(self.urlconf), first)
+
+    def test_in_place_change_to_held_list_remains_visible(self):
+        # Historical behavior: the patterns list is held by reference, so an
+        # in-place edit is seen by resolve() without replacing urlpatterns or
+        # clearing a cache. (Assigning a new urlpatterns object is the refresh
+        # covered by the other tests.)
+        table = [path("a/<int:pk>/", refresh_view_one, name="a")]
+        self.urlconf.urlpatterns = table
+        self.assertEqual(resolve("/a/1/", self.urlconf).kwargs, {"pk": 1})
+        table.append(path("b/<int:x>/", refresh_view_two, name="b"))
+        self.assertEqual(resolve("/b/2/", self.urlconf).kwargs, {"x": 2})
+        self.assertIs(resolve("/b/2/", self.urlconf).func, refresh_view_two)
+        self.assertEqual(resolve("/a/3/", self.urlconf).kwargs, {"pk": 3})
+
 
