@@ -1,0 +1,11 @@
+# Minimal catalog so that check_for_language("zh") succeeds and "zh" is a
+# supported language for the tests, which build their URLconf with
+# i18n_patterns() and LANGUAGES=[en, zh].
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh\n"
+
+msgid "i18n resolve test catalog"
+msgstr "i18n 解析测试目录"
