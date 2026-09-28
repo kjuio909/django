@@ -1515,6 +1515,73 @@ class ModelChoiceField(ChoiceField):
         self.limit_choices_to = limit_choices_to  # limit the queryset later.
         self.to_field_name = to_field_name
 
+    @property
+    def composite_pk_field(self):
+        """
+        Return the CompositePrimaryKey of the queryset's model, or None for a
+        single-field primary key (or when to_field_name is used).
+        """
+        from django.db.models.fields.composite import CompositePrimaryKey
+
+        if self.queryset is None:
+            return None
+        pk = self.queryset.model._meta.pk
+        if self.to_field_name is None and isinstance(pk, CompositePrimaryKey):
+            return pk
+        return None
+
+    def encode_composite_pk(self, value):
+        """
+        Encode a composite primary key (a tuple/list of components, or a value
+        already encoded as a string) into the string used in choice values and
+        widget data. Non-composite keys and empty values are returned as-is.
+        """
+        if value is None or isinstance(value, str) or self.composite_pk_field is None:
+            return value
+        return self.composite_pk_field.value_to_string(value)
+
+    def decode_composite_pk(self, value):
+        """
+        Decode an encoded composite primary key string into a tuple of
+        converted component values. Raise ValueError or ValidationError if the
+        value is corrupted, has the wrong number of components, or a component
+        can't be converted.
+        """
+        pk_field = self.composite_pk_field
+        if pk_field is None:
+            return value
+        if isinstance(value, (tuple, list)):
+            decoded = tuple(value)
+        elif isinstance(value, str):
+            decoded = tuple(pk_field.to_python(value))
+        else:
+            raise ValueError("Composite primary key must be a list or a tuple.")
+        if len(decoded) != len(pk_field):
+            raise ValueError(
+                "Composite primary key must have %d parts." % len(pk_field)
+            )
+        # A None component can't identify a relation target (the ORM rejects
+        # such keys); reject it along with values that aren't scalars.
+        if any(component is None for component in decoded):
+            raise ValueError("Composite primary key components cannot be null.")
+        if any(isinstance(component, (list, tuple, dict)) for component in decoded):
+            raise ValueError("Composite primary key components must be scalars.")
+        return decoded
+
+    def normalize_choice_value(self, value):
+        """
+        Normalize a single choice value (raw or encoded) to a comparable
+        string. Composite keys round-trip through decode/encode so equivalent
+        encodings compare equal; un-decodable values fall back to their string
+        representation.
+        """
+        if self.composite_pk_field is None:
+            return str(value)
+        try:
+            return self.encode_composite_pk(self.decode_composite_pk(value))
+        except (ValueError, TypeError, OverflowError, ValidationError):
+            return str(value)
+
     def validate_no_null_characters(self, value):
         non_null_character_validator = ProhibitNullCharactersValidator()
         return non_null_character_validator(value)
@@ -1575,10 +1642,13 @@ class ModelChoiceField(ChoiceField):
     def prepare_value(self, value):
         if hasattr(value, "_meta"):
             if self.to_field_name:
-                return value.serializable_value(self.to_field_name)
+                value = value.serializable_value(self.to_field_name)
             else:
-                return value.pk
-        return super().prepare_value(value)
+                value = value.pk
+        value = super().prepare_value(value)
+        # Composite primary keys are tuples; encode them to the string used in
+        # choice values and rendered widgets.
+        return self.encode_composite_pk(value)
 
     def to_python(self, value):
         if value in self.empty_values:
@@ -1588,10 +1658,13 @@ class ModelChoiceField(ChoiceField):
             key = self.to_field_name or "pk"
             if isinstance(value, self.queryset.model):
                 value = getattr(value, key)
+            elif self.composite_pk_field is not None and isinstance(value, str):
+                value = self.decode_composite_pk(value)
             value = self.queryset.get(**{key: value})
         except (
             ValueError,
             TypeError,
+            OverflowError,
             self.queryset.model.DoesNotExist,
             ValidationError,
         ):
@@ -1610,7 +1683,9 @@ class ModelChoiceField(ChoiceField):
             return False
         initial_value = initial if initial is not None else ""
         data_value = data if data is not None else ""
-        return str(self.prepare_value(initial_value)) != str(data_value)
+        return self.normalize_choice_value(
+            self.prepare_value(initial_value)
+        ) != self.normalize_choice_value(data_value)
 
 
 class ModelMultipleChoiceField(ModelChoiceField):
@@ -1658,6 +1733,7 @@ class ModelMultipleChoiceField(ModelChoiceField):
         invalid (not a valid PK, not in the queryset, etc.)
         """
         key = self.to_field_name or "pk"
+        composite_pk_field = self.composite_pk_field
         # deduplicate given values to avoid creating many querysets or
         # requiring the database backend deduplicate efficiently.
         try:
@@ -1668,6 +1744,46 @@ class ModelMultipleChoiceField(ModelChoiceField):
                 self.error_messages["invalid_list"],
                 code="invalid_list",
             )
+        if composite_pk_field is not None:
+            # Values are encoded composite primary key strings. Decode each one
+            # into the tuple of converted components; anything malformed, with
+            # the wrong number of components, or with an unconvertible
+            # component is an invalid choice.
+            decoded_values = set()
+            for val in value:
+                if isinstance(val, self.queryset.model):
+                    val = val.pk
+                if val in self.empty_values:
+                    raise ValidationError(
+                        self.error_messages["invalid_choice"],
+                        code="invalid_choice",
+                        params={"value": val},
+                    )
+                try:
+                    self.validate_no_null_characters(val)
+                    decoded_values.add(self.decode_composite_pk(val))
+                except (ValueError, TypeError, OverflowError, ValidationError):
+                    raise ValidationError(
+                        self.error_messages["invalid_choice"],
+                        code="invalid_choice",
+                        params={"value": val},
+                    )
+            try:
+                qs = self.queryset.filter(**{"%s__in" % key: list(decoded_values)})
+                pks = {composite_pk_field.value_to_string(getattr(o, key)) for o in qs}
+            except (ValueError, TypeError, OverflowError):
+                raise ValidationError(
+                    self.error_messages["invalid_choice"],
+                    code="invalid_choice",
+                )
+            for val in value:
+                if self.normalize_choice_value(val) not in pks:
+                    raise ValidationError(
+                        self.error_messages["invalid_choice"],
+                        code="invalid_choice",
+                        params={"value": val},
+                    )
+            return qs
         for pk in value:
             self.validate_no_null_characters(pk)
             try:
@@ -1708,8 +1824,9 @@ class ModelMultipleChoiceField(ModelChoiceField):
             data = []
         if len(initial) != len(data):
             return True
-        initial_set = {str(value) for value in self.prepare_value(initial)}
-        data_set = {str(value) for value in data}
+        normalize = self.normalize_choice_value
+        initial_set = {normalize(value) for value in self.prepare_value(initial)}
+        data_set = {normalize(value) for value in data}
         return data_set != initial_set
 
 

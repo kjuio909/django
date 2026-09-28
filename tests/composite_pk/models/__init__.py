@@ -1,10 +1,13 @@
 from .tenant import (
     Board,
+    Bookmark,
+    Book,
     Comment,
     Label,
     Member,
     Post,
     PostDbDefault,
+    Shelf,
     Tag,
     Tenant,
     TimeStamped,
@@ -14,11 +17,14 @@ from .tenant import (
 
 __all__ = [
     "Board",
+    "Book",
+    "Bookmark",
     "Comment",
     "Label",
     "Member",
     "Post",
     "PostDbDefault",
+    "Shelf",
     "Tag",
     "Tenant",
     "TimeStamped",

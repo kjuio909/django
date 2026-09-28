@@ -1354,6 +1354,13 @@ model object (in the case of ``ModelChoiceField``) or multiple model
 objects (in the case of ``ModelMultipleChoiceField``) into the
 ``cleaned_data`` dictionary of the form.
 
+When the related model has a :doc:`composite primary key
+</topics/composite-primary-key>`, choice values encode the full key as a
+JSON array of the component values in declaration order. A value that is
+unknown, malformed, has the wrong number of components, or contains a
+component that can't be converted is rejected with code
+``invalid_choice``.
+
 For more complex uses, you can specify ``queryset=None`` when declaring the
 form field and then populate the ``queryset`` in the form's ``__init__()``
 method::

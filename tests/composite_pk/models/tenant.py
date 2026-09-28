@@ -101,3 +101,30 @@ class Member(models.Model):
     friends = models.ManyToManyField("self")
     posts = models.ManyToManyField(Post, related_name="member_authors")
     labels = models.ManyToManyField(Label, related_name="members")
+
+
+class Book(models.Model):
+    """
+    Target with a two-field composite primary key whose second component is a
+    text field, so values such as the empty string stay distinguishable.
+    """
+
+    pk = models.CompositePrimaryKey("tenant_id", "isbn")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    isbn = models.CharField(max_length=30)
+    title = models.CharField(max_length=50, default="")
+
+
+class Shelf(models.Model):
+    """Holder of many-to-many relations to composite- and single-pk models."""
+
+    name = models.CharField(max_length=50)
+    books = models.ManyToManyField(Book, related_name="shelves")
+    tags = models.ManyToManyField(Tag, related_name="shelves")
+
+
+class Bookmark(models.Model):
+    """Holder of a many-to-many relation to a single-primary-key model."""
+
+    name = models.CharField(max_length=50)
+    tags = models.ManyToManyField(Tag, related_name="bookmarks")

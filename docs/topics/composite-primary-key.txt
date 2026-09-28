@@ -192,6 +192,37 @@ This form does not have a form field ``pk`` for the composite primary key:
 Setting the primary composite field ``pk`` as a form field raises an unknown
 field :exc:`.FieldError`.
 
+Many-to-many relations
+----------------------
+
+A :class:`~django.db.models.ManyToManyField` pointing at a model with a
+composite primary key is supported by
+:class:`~django.forms.ModelMultipleChoiceField` (for example in a
+:class:`~django.forms.ModelForm`). Choice values carry the full composite key,
+encoded as a JSON array of the component values in declaration order:
+
+.. code-block:: python
+
+    class OrderItem(models.Model):
+        pk = models.CompositePrimaryKey("order_id", "sku")
+        order = models.ForeignKey(Order, on_delete=models.CASCADE)
+        sku = models.CharField(max_length=20)
+
+
+    class Cart(models.Model):
+        items = models.ManyToManyField(OrderItem)
+
+.. code-block:: pycon
+
+    >>> form = modelform_factory(Cart, fields=["items"])()
+    >>> [str(value) for value, _ in form.fields["items"].choices]
+    ['["1", "A755H"]']
+
+Submitting an unknown, tampered, or malformed value -- including one with the
+wrong number of components or a component that can't be converted -- raises a
+:class:`~django.core.exceptions.ValidationError` with code ``invalid_choice``,
+and the relation is left unchanged.
+
 .. admonition:: Primary key fields are read only
 
     If you change the value of a primary key on an existing object and then

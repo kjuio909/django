@@ -139,7 +139,10 @@ class CompositePrimaryKey(Field):
 
     def value_to_string(self, obj):
         values = []
-        vals = self.value_from_object(obj)
+        if isinstance(obj, (list, tuple)):
+            vals = obj
+        else:
+            vals = self.value_from_object(obj)
         for field, value in zip(self.fields, vals):
             if value is None:
                 values.append(None)
@@ -152,6 +155,10 @@ class CompositePrimaryKey(Field):
         if isinstance(value, str):
             # Assume we're deserializing.
             vals = json.loads(value)
+            if not isinstance(vals, list) or len(vals) != len(self.fields):
+                raise ValueError(
+                    f"{self.name!r} must be a list of {len(self.fields)} elements."
+                )
             value = [
                 field.to_python(val)
                 for field, val in zip(self.fields, vals, strict=True)
