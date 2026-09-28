@@ -1126,3 +1126,114 @@ class I18NPrefixAndConverterResolveTests(SimpleTestCase):
         self.assertIsInstance(match.kwargs["pk"], int)
         with self.assertRaises(Resolver404):
             resolve("/plain/7", urlconf)
+
+
+def _query_fragment_urlconf():
+    # A temporary URLconf handed directly to resolve(): converter endpoints
+    # both with and without a trailing slash, a capture followed by a route
+    # literal, an include(), language prefixes and a legacy re_path().
+    from django.conf.urls.i18n import i18n_patterns
+
+    nested = [path("d/<path:p>", empty_view, name="inc-d")]
+    return [
+        *i18n_patterns(
+            path("q/<path:p>", empty_view, name="q"),
+            path("u/<str:name>", empty_view, name="u"),
+            path("mid/<path:p>/after/", empty_view, name="mid-after"),
+            path("inc/", include(nested)),
+        ),
+        path("plain/<path:p>", empty_view, name="plain-p"),
+        path("literal/<path:p>/after/", empty_view, name="literal-after"),
+        re_path(r"^legacy/(?P<oid>[0-9]+)/$", empty_view, name="legacy"),
+    ]
+
+
+@override_settings(
+    USE_I18N=True,
+    LANGUAGE_CODE="en",
+    LANGUAGES=[("en", "English"), ("zh", "Chinese")],
+    LOCALE_PATHS=[_LOCALE_DIR],
+)
+class QueryFragmentTerminalCaptureResolveTests(SimpleTestCase):
+    """
+    A literal '?' or '#' -- the query-string and fragment delimiters -- must
+    never be silently swallowed by a converter capture that terminates a
+    route. The WSGI gateway strips a genuine query/fragment before building
+    PATH_INFO, but a percent-encoded '%3F'/'%23' is decoded into a literal
+    '?'/'#' on its way in, so the resolver distinguishes the two by position:
+    a delimiter that still has route text after it is data (as in the admin's
+    '<path:object_id>/change/'), while one reached by the greedy, terminating
+    capture of a <path>/<str> route is a query or fragment leaking into the
+    match and must fail with Resolver404.
+    """
+
+    def setUp(self):
+        self.urlconf = _query_fragment_urlconf()
+
+    def test_terminal_capture_rejects_query_and_fragment(self):
+        invalid_paths = (
+            "/plain/a?x=1",
+            "/plain/a#frag",
+            "/plain/a?x=1#f",
+            "/q/a?x=1",
+            "/q/a#frag",
+            "/q/a?x=1#f",
+            "/u/a?x=1",
+            "/u/a#frag",
+            "/inc/d/a?x=1",
+            "/inc/d/a#f",
+            "/en/q/a?x=1",
+            "/en/u/a#frag",
+            "/zh/q/a?x=1",
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(Resolver404):
+                    resolve(path, self.urlconf)
+
+    def test_repeated_resolution_after_query_failure_is_unchanged(self):
+        with self.assertRaises(Resolver404):
+            resolve("/plain/a?x=1", self.urlconf)
+        match = resolve("/plain/a%3Fx%3D1", self.urlconf)
+        self.assertEqual(match.kwargs, {"p": "a?x=1"})
+        with self.assertRaises(Resolver404):
+            resolve("/plain/a#f", self.urlconf)
+        again = resolve("/plain/a%3Fx%3D1", self.urlconf)
+        self.assertEqual(again.kwargs, match.kwargs)
+        self.assertEqual(type(again.kwargs["p"]), type(match.kwargs["p"]))
+
+    def test_encoded_delimiter_in_terminal_capture_is_data(self):
+        # '%3F'/'%23' are decoded once and kept as the single parameter value;
+        # a double-encoded escape decodes once into a literal '%3F'.
+        self.assertEqual(
+            resolve("/plain/a%3Fx%3D1", self.urlconf).kwargs, {"p": "a?x=1"}
+        )
+        self.assertEqual(
+            resolve("/plain/a%23frag", self.urlconf).kwargs, {"p": "a#frag"}
+        )
+        self.assertEqual(resolve("/zh/q/a%3Fb", self.urlconf).kwargs, {"p": "a?b"})
+        self.assertEqual(
+            resolve("/plain/a%253Fb", self.urlconf).kwargs, {"p": "a%3Fb"}
+        )
+
+    def test_literal_delimiter_with_following_route_text_is_data(self):
+        # A capture followed by a route literal (or more of an include) can
+        # hold a decoded '?'/'#', mirroring the admin object-id routes. The
+        # parameter is returned once, with its type and key unchanged by the
+        # language prefix.
+        en = resolve("/en/mid/a?x=1/after/", self.urlconf)
+        zh = resolve("/zh/mid/a%23b/after/", self.urlconf)
+        self.assertEqual(en.kwargs, {"p": "a?x=1"})
+        self.assertEqual(zh.kwargs, {"p": "a#b"})
+        plain = resolve("/literal/a?x=1/after/", self.urlconf)
+        self.assertEqual(plain.kwargs, {"p": "a?x=1"})
+        self.assertEqual(type(en.kwargs["p"]), type(plain.kwargs["p"]))
+        self.assertEqual(list(en.kwargs), list(plain.kwargs))
+
+    def test_legacy_re_path_with_trailing_slash_rejects_suffix(self):
+        with self.assertRaises(Resolver404):
+            resolve("/legacy/9/?x=1", self.urlconf)
+        with self.assertRaises(Resolver404):
+            resolve("/legacy/9/#f", self.urlconf)
+        self.assertEqual(resolve("/legacy/9/", self.urlconf).kwargs, {"oid": "9"})
+

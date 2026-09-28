@@ -455,9 +455,33 @@ class RoutePattern(CheckURLMixin):
                 # RoutePattern doesn't allow non-named groups so args are
                 # ignored.
                 kwargs = match.groupdict()
+                match_end = match.end()
                 for key, value in kwargs.items():
                     converter = self.converters[key]
                     try:
+                        # A literal '?' or '#' introduces the query string or
+                        # the fragment. Such a character reaches PATH_INFO
+                        # only as decoded data: an encoded '%3F'/'%23' arrives
+                        # as '?'/'#' while a genuine query or fragment is
+                        # stripped before the resolver, so it can only appear
+                        # at the *end* of the path. A capture that terminates
+                        # the whole match (nothing of the path remains and no
+                        # route literal follows it) -- notably a greedy
+                        # <path>/<str> endpoint -- would otherwise swallow a
+                        # trailing query or fragment as parameter data and
+                        # silently ignore the suffix; reject the match
+                        # instead. A capture followed by more route text (an
+                        # include() prefix or an endpoint literal) can still
+                        # hold a decoded '?'/'#' as ordinary data. The test
+                        # runs on the raw capture, so an encoded
+                        # '%3F'/'%23' is never affected.
+                        if (
+                            value is not None
+                            and match_end == len(path)
+                            and match.end(key) == match_end
+                            and ("?" in value or "#" in value)
+                        ):
+                            return None
                         # Matching runs against the raw, still-encoded path
                         # so an encoded slash cannot split a capture into
                         # path levels. Decode the capture exactly once and
