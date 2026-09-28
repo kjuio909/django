@@ -280,9 +280,14 @@ def items_for_result(cl, result, form):
                 # Problem cases are non-ASCII strings.
                 if cl.to_field:
                     attr = str(cl.to_field)
+                    value = result.serializable_value(attr)
+                elif cl.opts.is_composite_pk:
+                    # The opener widget identifies targets by the encoded
+                    # composite primary key used in choice values.
+                    value = cl.opts.pk.value_to_string(result)
                 else:
                     attr = pk
-                value = result.serializable_value(attr)
+                    value = result.serializable_value(attr)
                 link_or_text = format_html(
                     '<a href="{}"{}>{}</a>',
                     url,

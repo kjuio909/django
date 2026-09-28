@@ -255,7 +255,29 @@ class ManyToManyRawIdWidget(ForeignKeyRawIdWidget):
     def value_from_datadict(self, data, files, name):
         value = data.get(name)
         if value:
+            return self.split_values(value)
+        return value
+
+    def split_values(self, value):
+        if not self.rel.model._meta.is_composite_pk:
             return value.split(",")
+        # Encoded composite primary keys are JSON arrays, which themselves
+        # contain commas, so split at the JSON value boundaries instead
+        # of the commas. A value that doesn't decode is returned whole so
+        # the form field reports it as an invalid choice.
+        decoder = json.JSONDecoder()
+        values = []
+        index = 0
+        length = len(value)
+        try:
+            while index < length:
+                part, index = decoder.raw_decode(value, index)
+                values.append(json.dumps(part, ensure_ascii=False))
+                while index < length and value[index] in ", \t\r\n":
+                    index += 1
+        except json.JSONDecodeError:
+            return [value]
+        return values
 
     def format_value(self, value):
         return ",".join(str(v) for v in value) if value else ""
@@ -343,18 +365,25 @@ class RelatedFieldWidgetWrapper(forms.Widget):
 
         rel_opts = self.rel.model._meta
         info = (rel_opts.app_label, rel_opts.model_name)
-        related_field_name = self.rel.get_related_field().name
+        # A relation to a model with a composite primary key can only be
+        # addressed by the whole key: get_related_field() returns a single
+        # component field, which must never be sent as _to_field.
+        related_field_name = (
+            None if rel_opts.is_composite_pk else self.rel.get_related_field().name
+        )
         app_label = self.rel.field.model._meta.app_label
         model_name = self.rel.field.model._meta.model_name
 
-        url_params = "&".join(
-            "%s=%s" % param
+        params = [
+            param
             for param in [
-                (TO_FIELD_VAR, related_field_name),
+                (TO_FIELD_VAR, related_field_name) if related_field_name else None,
                 (IS_POPUP_VAR, 1),
                 (SOURCE_MODEL_VAR, f"{app_label}.{model_name}"),
             ]
-        )
+            if param is not None
+        ]
+        url_params = "&".join("%s=%s" % param for param in params)
         context = {
             "rendered_widget": self.widget.render(name, value, attrs),
             "is_hidden": self.is_hidden,
@@ -375,7 +404,11 @@ class RelatedFieldWidgetWrapper(forms.Widget):
                 info, "delete", "__fk__"
             )
         if self.can_view_related or self.can_change_related:
-            context["view_related_url_params"] = f"{TO_FIELD_VAR}={related_field_name}"
+            context["view_related_url_params"] = (
+                f"{TO_FIELD_VAR}={related_field_name}"
+                if related_field_name is not None
+                else ""
+            )
             context["change_related_template_url"] = self.get_related_url(
                 info, "change", "__fk__"
             )
@@ -576,16 +609,34 @@ class AutocompleteMixin:
         if not self.is_required and not self.allow_multiple_selected:
             default[1].append(self.create_option(name, "", "", False, 0))
         remote_model_opts = self.field.remote_field.model._meta
-        to_field_name = getattr(
-            self.field.remote_field, "field_name", remote_model_opts.pk.attname
-        )
-        to_field_name = remote_model_opts.get_field(to_field_name).attname
-        choices = (
-            (getattr(obj, to_field_name), self.choices.field.label_from_instance(obj))
-            for obj in self.choices.queryset.using(self.db).filter(
-                **{"%s__in" % to_field_name: selected_choices}
+        if remote_model_opts.is_composite_pk:
+            # A composite primary key is encoded as the string used in choice
+            # values.
+            form_field = self.choices.field
+            decoded_values = [form_field.decode_composite_pk(v) for v in value]
+            choices = (
+                (
+                    remote_model_opts.pk.value_to_string(obj),
+                    form_field.label_from_instance(obj),
+                )
+                for obj in self.choices.queryset.using(self.db).filter(
+                    pk__in=decoded_values
+                )
             )
-        )
+        else:
+            to_field_name = getattr(
+                self.field.remote_field, "field_name", remote_model_opts.pk.attname
+            )
+            to_field_name = remote_model_opts.get_field(to_field_name).attname
+            choices = (
+                (
+                    getattr(obj, to_field_name),
+                    self.choices.field.label_from_instance(obj),
+                )
+                for obj in self.choices.queryset.using(self.db).filter(
+                    **{"%s__in" % to_field_name: selected_choices}
+                )
+            )
         for option_value, option_label in choices:
             selected = str(option_value) in value and (
                 has_selected is False or self.allow_multiple_selected

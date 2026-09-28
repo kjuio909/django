@@ -1654,7 +1654,9 @@ class ModelAdmin(BaseModelAdmin):
                 attr = str(to_field)
                 value = obj.serializable_value(attr)
             elif self.opts.is_composite_pk:
-                value = quote(obj.pk)
+                # The opener form field identifies targets by the encoded
+                # composite primary key used in its choice values.
+                value = self.opts.pk.value_to_string(obj)
             else:
                 value = obj.serializable_value(obj._meta.pk.attname)
             popup_response = {
@@ -1764,10 +1766,13 @@ class ModelAdmin(BaseModelAdmin):
             opts = obj._meta
             to_field = request.POST.get(TO_FIELD_VAR)
             attr = str(to_field) if to_field else opts.pk.attname
-            value = request.resolver_match.kwargs["object_id"]
-            if opts.is_composite_pk:
-                new_value = quote(obj.pk)
+            if opts.is_composite_pk and not to_field:
+                # The opener form field identifies targets by the encoded
+                # composite primary key used in choice values.
+                value = opts.pk.value_to_string(obj)
+                new_value = value
             else:
+                value = request.resolver_match.kwargs["object_id"]
                 new_value = obj.serializable_value(attr)
             popup_response_data = json.dumps(
                 {
@@ -2639,10 +2644,13 @@ class ModelAdmin(BaseModelAdmin):
             if perms_needed:
                 raise PermissionDenied
             obj_display = str(obj)
-            attr = str(to_field) if to_field else self.opts.pk.attname
-            obj_id = obj.serializable_value(attr)
             if self.opts.is_composite_pk and not to_field:
-                obj_id = quote(obj_id)
+                # The opener form field identifies targets by the encoded
+                # composite primary key used in choice values.
+                obj_id = self.opts.pk.value_to_string(obj)
+            else:
+                attr = str(to_field) if to_field else self.opts.pk.attname
+                obj_id = obj.serializable_value(attr)
             self.log_deletions(request, [obj])
             self.delete_model(request, obj)
 

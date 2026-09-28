@@ -80,6 +80,14 @@ Models with composite primary keys can be registered with the
 joined with a comma in admin URLs (e.g. ``1,abc``), and the value stored in
 ``LogEntry.object_id`` is a JSON array of the parts.
 
+:class:`~django.db.models.ManyToManyField` relations pointing at a model
+with a composite primary key can be edited in the admin, including the
+``raw_id_fields``, ``filter_horizontal``/``filter_vertical`` and
+``autocomplete_fields`` widgets. Each option value carries the full composite key
+encoded as a JSON array (in the primary key field's declaration order), so
+parts containing commas, quotes or other special characters round-trip
+unambiguously.
+
 Migrating to a composite primary key
 ====================================
 

@@ -138,18 +138,20 @@ class AdminCompositePKTests(TestCase):
             fetch_redirect_response=False,
         )
 
-    def test_add_view_popup_value_is_quoted(self):
+    def test_add_view_popup_value_is_form_encoded(self):
         response = self.client.post(
             reverse("admin:admin_views_compositepkmodel_add"),
             {"foo": "p,o", "bar": "p/o", "_popup": "1"},
         )
         self.assertEqual(response.status_code, 200)
+        # The value matches the encoded composite key used in opener choice
+        # values so the popup can select the new object.
         self.assertJSONEqual(
             response.context["popup_response_data"],
-            {"value": quote(("p,o", "p/o")), "obj": "p,o,p/o"},
+            {"value": '["p,o", "p/o"]', "obj": "p,o,p/o"},
         )
 
-    def test_change_view_popup_new_value_is_quoted(self):
+    def test_change_view_popup_new_value_is_form_encoded(self):
         response = self.client.post(
             self.url("compositepkmodel_change", self.obj),
             {"foo": "f,o,o", "bar": "b/a/r", "name": "n", "_popup": "1"},
@@ -157,7 +159,9 @@ class AdminCompositePKTests(TestCase):
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.context["popup_response_data"])
         self.assertEqual(data["action"], "change")
-        self.assertEqual(data["new_value"], quote(self.obj.pk))
+        encoded = self.obj._meta.pk.value_to_string(self.obj)
+        self.assertEqual(data["value"], encoded)
+        self.assertEqual(data["new_value"], encoded)
 
     # -- Delete view ------------------------------------------------------
 

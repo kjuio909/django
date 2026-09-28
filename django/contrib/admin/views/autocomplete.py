@@ -47,7 +47,13 @@ class AutocompleteJsonView(BaseListView):
         Convert the provided model object to a dictionary that is added to the
         results list.
         """
-        return {"id": str(getattr(obj, to_field_name)), "text": str(obj)}
+        if to_field_name is None:
+            # A composite primary key is encoded as the string used in choice
+            # values.
+            value = obj._meta.pk.value_to_string(obj)
+        else:
+            value = str(getattr(obj, to_field_name))
+        return {"id": value, "text": str(obj)}
 
     def get_paginator(self, *args, **kwargs):
         """Use the ModelAdmin's paginator."""
@@ -109,12 +115,17 @@ class AutocompleteJsonView(BaseListView):
                 % type(model_admin).__qualname__
             )
 
-        to_field_name = getattr(
-            source_field.remote_field, "field_name", remote_model._meta.pk.attname
-        )
-        to_field_name = remote_model._meta.get_field(to_field_name).attname
-        if not model_admin.to_field_allowed(request, to_field_name):
-            raise PermissionDenied
+        # A relation to a model with a composite primary key can only be
+        # addressed by the whole key; there is no single related field.
+        if remote_model._meta.is_composite_pk:
+            to_field_name = None
+        else:
+            to_field_name = getattr(
+                source_field.remote_field, "field_name", remote_model._meta.pk.attname
+            )
+            to_field_name = remote_model._meta.get_field(to_field_name).attname
+            if not model_admin.to_field_allowed(request, to_field_name):
+                raise PermissionDenied
 
         return term, model_admin, source_field, to_field_name
 
