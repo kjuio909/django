@@ -1436,6 +1436,90 @@ class RuntimeURLConfRefreshTests(SimpleTestCase):
         with self.assertRaises(Resolver404):
             resolve("/old/1/", self.urlconf)
 
+    def test_none_urlpatterns_fails_and_restores_field_by_field(self):
+        # A publicly constructible invalid configuration: urlpatterns is set
+        # to None. Resolving any path -- old, new or missing -- must raise the
+        # configuration error, never a ResolverMatch or Resolver404, and must
+        # not leave a failed state behind once a valid table is back.
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        expected = _match_snapshot(resolve("/org/7/sec/news/article/8/", self.urlconf))
+        self.urlconf.urlpatterns = None
+        for url in (
+            "/org/7/sec/news/article/8/",
+            "/old/1/",
+            "/does/not/exist/",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(ImproperlyConfigured):
+                    resolve(url, self.urlconf)
+        # The failed refresh is rolled back: the previously working table is
+        # available again, with every result field identical, as soon as a
+        # valid table is reassigned.
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        self.assertEqual(
+            _match_snapshot(resolve("/org/7/sec/news/article/8/", self.urlconf)),
+            expected,
+        )
+        # Assigning another valid table takes effect immediately; neither the
+        # None table's failure nor the first table's routes linger.
+        self.urlconf.urlpatterns = [
+            path("plain/<int:pk>/", refresh_view_one, name="plain"),
+        ]
+        match = resolve("/plain/5/", self.urlconf)
+        self.assertIs(match.func, refresh_view_one)
+        self.assertEqual(match.view_name, "plain")
+        self.assertEqual(match.kwargs, {"pk": 5})
+        with self.assertRaises(Resolver404):
+            resolve("/org/7/sec/news/article/8/", self.urlconf)
+
+    def test_none_urlpatterns_from_cold_start(self):
+        # Without a previously loaded table, None still raises the
+        # configuration error (rather than a 404) and the first valid table
+        # takes effect afterwards.
+        urlconf = _RefreshableURLConf(None)
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/anything/", urlconf)
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/anything/", urlconf)
+        urlconf.urlpatterns = [path("a/<int:pk>/", refresh_view_one, name="a")]
+        match = resolve("/a/3/", urlconf)
+        self.assertIs(match.func, refresh_view_one)
+        self.assertEqual(match.kwargs, {"pk": 3})
+
+    def test_none_failure_does_not_cross_urlconfs(self):
+        # One urlconf parked on an invalid table must not change what another
+        # urlconf resolves, nor must the second's failure pollute the first.
+        other = _RefreshableURLConf(
+            [path("other/<int:x>/", refresh_view_two, name="other")]
+        )
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        resolve("/org/1/sec/a/article/1/", self.urlconf)
+        resolve("/other/2/", other)
+
+        self.urlconf.urlpatterns = None
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/org/1/sec/a/article/1/", self.urlconf)
+        match = resolve("/other/3/", other)
+        self.assertIs(match.func, refresh_view_two)
+        self.assertEqual(match.namespaces, [])
+        self.assertEqual(match.kwargs, {"x": 3})
+
+        other.urlpatterns = None
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/other/3/", other)
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/org/1/sec/a/article/1/", self.urlconf)
+
+        self.urlconf.urlpatterns = _new_nested_patterns()
+        match = resolve("/org/4/sec/b/article/3/", self.urlconf)
+        self.assertEqual(match.view_name, "mid:inner:article")
+        self.assertEqual(match.kwargs, {"org": 4, "section": "b", "article_id": 3})
+        with self.assertRaises(ImproperlyConfigured):
+            resolve("/other/3/", other)
+        other.urlpatterns = [path("other/<int:x>/", refresh_view_two, name="other")]
+        match = resolve("/other/9/", other)
+        self.assertEqual(match.kwargs, {"x": 9})
+
     def test_repeated_equivalent_replacements_are_comparable(self):
         table = [path("plain/<int:pk>/", refresh_view_one, name="plain")]
         self.urlconf.urlpatterns = table
