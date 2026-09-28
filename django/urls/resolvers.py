@@ -11,6 +11,7 @@ import inspect
 import re
 import string
 import sys
+import weakref
 from importlib import import_module
 from pickle import PicklingError
 from urllib.parse import quote, unquote
@@ -123,6 +124,16 @@ def get_resolver(urlconf=None):
 # invalid table cannot destroy the resolver's previously working table.
 _resolver_cache: dict = {}
 
+# Materialized snapshot of each one-shot iterable exposed as a routing table
+# (a generator), keyed by the iterable itself with a weak reference. A list
+# or tuple is held directly and needs no snapshot; a generator is consumed
+# exactly once, and a freshly constructed child resolver that ends up
+# pointing at the same exposed generator (e.g. the parent table is rebuilt
+# with include() while a nested module keeps exposing the same object) shares
+# its snapshot instead of iterating the exhausted generator a second time.
+# The weak key lets a discarded iterable -- and its snapshot -- be reclaimed.
+_oneshot_patterns_cache = weakref.WeakKeyDictionary()
+
 
 def _get_cached_resolver(urlconf=None):
     try:
@@ -139,45 +150,6 @@ def _get_cached_resolver(urlconf=None):
         resolver = URLResolver(RegexPattern(r"^/"), urlconf)
         _resolver_cache[urlconf] = resolver
         return resolver
-
-
-def _patterns_of(urlconf_name):
-    """Return the pattern list referenced by a resolver's urlconf_name."""
-    if isinstance(urlconf_name, str):
-        urlconf_module = import_module(urlconf_name)
-    else:
-        urlconf_module = urlconf_name
-    return getattr(urlconf_module, "urlpatterns", urlconf_module)
-
-
-def _validate_patterns(patterns, urlconf_name):
-    """
-    Validate a candidate routing table before it replaces a working one.
-
-    Every entry must be a pattern with a compilable regex; nested include()
-    tables are read directly so validation never mutates a (possibly shared)
-    child resolver's cache. Any failure raises -- usually
-    ImproperlyConfigured -- and leaves the caller's currently loaded table
-    untouched.
-    """
-    for url_pattern in patterns:
-        if not isinstance(url_pattern, (URLPattern, URLResolver)):
-            raise ImproperlyConfigured(
-                "The URLconf %r contains an entry that is not a valid URL "
-                "pattern: %r" % (urlconf_name, url_pattern)
-            )
-        # Accessing regex compiles it, so an invalid regular expression fails
-        # the refresh rather than the first request reaching the pattern.
-        _ = url_pattern.pattern.regex
-        if isinstance(url_pattern, URLResolver):
-            try:
-                nested = list(_patterns_of(url_pattern.urlconf_name))
-            except TypeError as e:
-                raise ImproperlyConfigured(
-                    "The included URLconf '%s' does not appear to have any "
-                    "patterns in it." % url_pattern.urlconf_name
-                ) from e
-            _validate_patterns(nested, url_pattern.urlconf_name)
 
 
 @functools.cache
@@ -1060,6 +1032,124 @@ class URLResolver:
             return getattr(module, "urlpatterns", module)
         return getattr(self.urlconf_name, "urlpatterns", self.urlconf_name)
 
+    @staticmethod
+    def _materialize_patterns(patterns_ref, urlconf_name):
+        """
+        Turn the object exposed as ``urlpatterns`` into a walkable sequence.
+
+        A reusable sequence (a list or tuple, the normal case) is returned as
+        is so in-place edits stay visible; a one-shot iterable (a generator)
+        is materialized into a list exactly once. The snapshot is shared by
+        identity of the exposed iterable, so a freshly constructed child
+        resolver that ends up pointing at the same already-consumed object
+        (its parent table was rebuilt with include() while the nested module
+        kept exposing it) reuses the snapshot instead of iterating it a second
+        time and seeing an empty table.
+        """
+        if isinstance(patterns_ref, (list, tuple)):
+            return patterns_ref
+        try:
+            snapshot = _oneshot_patterns_cache.get(patterns_ref)
+        except TypeError:
+            snapshot = None
+        if snapshot is not None:
+            return snapshot
+        try:
+            snapshot = list(patterns_ref)
+        except TypeError as e:
+            msg = (
+                "The included URLconf '{name}' does not appear to have any "
+                "patterns in it. If you see the 'urlpatterns' variable with "
+                "valid patterns in the file then the issue is probably caused "
+                "by a circular import."
+            )
+            raise ImproperlyConfigured(msg.format(name=urlconf_name)) from e
+        try:
+            _oneshot_patterns_cache[patterns_ref] = snapshot
+        except TypeError:
+            # An unhashable or non-weak-referenceable one-shot iterable can
+            # only be snapshotted for this resolver; it cannot be shared with
+            # a resolver constructed later.
+            pass
+        return snapshot
+
+    def _build_candidate(self, urlconf_module, patterns_ref):
+        """
+        Build and validate -- without installing -- the routing table this
+        resolver would serve if it adopted *patterns_ref*.
+
+        Returns ``(patterns, children)`` where *patterns* is the materialized
+        candidate table and *children* lists, for every include() in it whose
+        nested table must be (re)installed,
+        ``(resolver, urlconf_module, patterns_ref, patterns, children)``.
+
+        Nested tables are read through the candidate child URLResolver
+        objects -- the very objects resolve() later walks -- rather than
+        re-importing them, so building never disturbs a resolver reachable
+        from another (still live) table. A child that already serves the
+        candidate table by identity reuses its installed snapshot, so a
+        materialized one-shot iterable is never iterated a second time and an
+        unchanged child is left alone. Every entry must be a pattern with a
+        compilable regex; any failure raises ImproperlyConfigured before
+        anything is installed.
+        """
+        patterns = self._materialize_patterns(patterns_ref, self.urlconf_name)
+        children = []
+        for url_pattern in patterns:
+            if not isinstance(url_pattern, (URLPattern, URLResolver)):
+                raise ImproperlyConfigured(
+                    "The URLconf %r contains an entry that is not a valid URL "
+                    "pattern: %r" % (self.urlconf_name, url_pattern)
+                )
+            # Accessing regex compiles it, so an invalid regular expression
+            # fails the refresh rather than the first request reaching it.
+            _ = url_pattern.pattern.regex
+            if isinstance(url_pattern, URLResolver):
+                nested_module, nested_ref = url_pattern._current_patterns()
+                if (
+                    url_pattern._loaded
+                    and url_pattern._loaded_patterns_ref is nested_ref
+                ):
+                    # The candidate child already serves this table (a
+                    # reusable list/tuple it holds by reference, or a one-shot
+                    # iterable it snapshotted): reuse it untouched.
+                    continue
+                nested_patterns, nested_children = url_pattern._build_candidate(
+                    nested_module, nested_ref
+                )
+                children.append(
+                    (
+                        url_pattern,
+                        nested_module,
+                        nested_ref,
+                        nested_patterns,
+                        nested_children,
+                    )
+                )
+        return patterns, children
+
+    @staticmethod
+    def _install_candidate(patterns, children):
+        """
+        Install a built candidate: nested tables deepest-first, then reset
+        this resolver's derived caches. Only called after the whole candidate
+        tree has built and validated successfully.
+        """
+        for child, child_module, child_ref, child_patterns, child_children in (
+            children
+        ):
+            child._install_candidate(child_patterns, child_children)
+            child._loaded_urlconf_module = child_module
+            child._loaded_patterns_ref = child_ref
+            child._loaded_url_patterns = child_patterns
+            child._patterns_generation += 1
+            child._reverse_dict = {}
+            child._namespace_dict = {}
+            child._app_dict = {}
+            child._callback_strs = set()
+            child._populated = False
+            child._loaded = True
+
     def _reload_patterns(self):
         """
         Make sure the cached urlconf module and its urlpatterns reflect the
@@ -1075,10 +1165,12 @@ class URLResolver:
         callback strings) are rebuilt from the new table on demand, without
         the caller clearing any cache.
 
-        A refresh onto a table that fails to load is never committed: it
-        cannot leave a half-installed table, the previously working table
-        stays available, and the next replacement (e.g. after the table is
-        fixed) takes effect immediately.
+        A refresh onto a table that fails to load is never committed: the
+        whole candidate tree (nested includes included) is built and validated
+        before anything is installed, so an invalid replacement cannot leave a
+        half-installed table, the previously working table keeps serving, and
+        the next replacement (e.g. after the table is fixed) takes effect
+        immediately.
 
         As historically, a urlpatterns that is itself a reusable sequence (a
         list or tuple, the normal case) is held by reference, so an in-place
@@ -1098,39 +1190,24 @@ class URLResolver:
         urlconf_module, patterns_ref = self._current_patterns()
         if self._loaded and patterns_ref is self._loaded_patterns_ref:
             return
-        if isinstance(patterns_ref, (list, tuple)):
-            # Hold the real sequence so an in-place edit remains visible,
-            # matching the historical cached list.
-            new_patterns = patterns_ref
-        else:
-            try:
-                # Materialize a one-shot iterable (a generator) once so it
-                # can be walked repeatedly -- by resolve(), checks and reverse
-                # lookups alike -- always reflecting this same table.
-                new_patterns = list(patterns_ref)
-            except TypeError as e:
-                msg = (
-                    "The included URLconf '{name}' does not appear to have "
-                    "any patterns in it. If you see the 'urlpatterns' "
-                    "variable with valid patterns in the file then the issue "
-                    "is probably caused by a circular import."
-                )
-                # Nothing has been committed yet, so the previously cached
-                # patterns stay in place and a still-valid old table keeps
-                # resolving.
-                raise ImproperlyConfigured(
-                    msg.format(name=self.urlconf_name)
-                ) from e
         if self._loaded:
-            # A refresh replaces a table that still works. Validate the whole
-            # candidate -- including nested includes -- before committing it,
-            # so an invalid replacement fails the call while the previously
-            # working table is left completely intact. Nested tables are read
-            # directly, so a (possibly shared) child resolver is never touched.
-            # An initial load keeps its historical, lazy behavior (an unusable
-            # pattern only fails the request that reaches it).
-            _validate_patterns(new_patterns, self.urlconf_name)
-        # Commit the refresh only once the new table has loaded successfully.
+            # A refresh replaces a table that still works. Build and validate
+            # the entire candidate -- nested includes included -- before
+            # installing any of it; _build_candidate() raises (usually
+            # ImproperlyConfigured) without touching self or any resolver
+            # reachable from the live table, so the previous table is left
+            # completely intact.
+            new_patterns, children = self._build_candidate(
+                urlconf_module, patterns_ref
+            )
+            self._install_candidate(new_patterns, children)
+        else:
+            # An initial load keeps its historical, lazy behavior: hold the
+            # exposed sequence (snapshotting a one-shot iterable once) and
+            # only fail on a pattern the request actually reaches.
+            new_patterns = self._materialize_patterns(
+                patterns_ref, self.urlconf_name
+            )
         self._loaded_urlconf_module = urlconf_module
         self._loaded_patterns_ref = patterns_ref
         self._loaded_url_patterns = new_patterns
