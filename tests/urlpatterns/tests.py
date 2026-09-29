@@ -1493,10 +1493,11 @@ class RuntimeURLConfRefreshTests(SimpleTestCase):
         self.assertIs(get_resolver(self.urlconf), first)
 
     def test_in_place_change_to_held_list_remains_visible(self):
-        # Historical behavior: the patterns list is held by reference, so an
-        # in-place edit is seen by resolve() without replacing urlpatterns or
-        # clearing a cache. (Assigning a new urlpatterns object is the refresh
-        # covered by the other tests.)
+        # An in-place edit of the retained patterns list is seen by resolve()
+        # without replacing urlpatterns or clearing a cache. (Assigning a new
+        # urlpatterns object is the refresh covered by the other tests; an
+        # in-place edit that leaves an invalid candidate is covered in
+        # urlpatterns_reverse.test_urlconf_refresh.)
         table = [path("a/<int:pk>/", refresh_view_one, name="a")]
         self.urlconf.urlpatterns = table
         self.assertEqual(resolve("/a/1/", self.urlconf).kwargs, {"pk": 1})
