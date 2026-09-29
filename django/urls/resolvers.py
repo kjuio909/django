@@ -755,14 +755,19 @@ class URLResolver:
         # The routing table currently loaded. ``_loaded_patterns_ref`` is the
         # exact object the urlconf exposes as ``urlpatterns`` (kept for an
         # identity comparison: because it is held, its id can never be reused
-        # by a replacement), and ``_loaded_url_patterns`` is the materialized
-        # list walked by resolve(). _patterns_generation advances on every
-        # committed refresh and versions derived caches. See
-        # _reload_patterns().
+        # by a replacement), ``_loaded_url_patterns`` is the materialized
+        # sequence walked by resolve(), and ``_loaded_patterns_signature``
+        # holds the entries it was loaded with in order. A reusable list is
+        # held by reference, so its identity survives an in-place edit; the
+        # signature detects that edit (an in-place replacement, append, pop or
+        # reorder), which is a refresh like any other.
+        # _patterns_generation advances on every committed refresh and
+        # versions derived caches. See _reload_patterns().
         self._loaded = False
         self._loaded_urlconf_module = None
         self._loaded_patterns_ref = None
         self._loaded_url_patterns = None
+        self._loaded_patterns_signature = None
         self._patterns_generation = 0
 
     def __repr__(self):
@@ -1073,27 +1078,53 @@ class URLResolver:
             pass
         return snapshot
 
+    @staticmethod
+    def _patterns_signature(patterns):
+        """
+        Content fingerprint of a materialized routing table: a tuple holding
+        (by identity) the entries in their loaded order.
+
+        A reusable sequence (a list or tuple) is held by reference, so an
+        in-place edit (``patterns[:] = ...``, append(), pop(), item
+        assignment) keeps the same object and cannot be told from an
+        unchanged table by identity alone. Comparing the live entries against
+        the ones held here with ``is`` changes exactly when an entry is added,
+        removed, replaced or reordered -- even by an equal-but-distinct
+        object, which is still an observable edit. Holding the entries also
+        keeps their addresses live, so the comparison cannot be fooled by an
+        id being reused after a removed entry was garbage collected.
+
+        It is only ever computed for an already materialized sequence, so a
+        one-shot iterable (a generator), whose content cannot change once
+        consumed, is never walked again.
+        """
+        return tuple(patterns)
+
     def _build_candidate(self, urlconf_module, patterns_ref):
         """
         Build and validate -- without installing -- the routing table this
         resolver would serve if it adopted *patterns_ref*.
 
-        Returns ``(patterns, children)`` where *patterns* is the materialized
-        candidate table and *children* lists, for every include() in it whose
-        nested table must be (re)installed,
-        ``(resolver, urlconf_module, patterns_ref, patterns, children)``.
+        Returns ``(patterns, signature, children)`` where *patterns* is the
+        materialized candidate table, *signature* is its content fingerprint
+        (see _patterns_signature()) and *children* lists, for every include()
+        in it whose nested table must be (re)installed,
+        ``(resolver, urlconf_module, patterns_ref, patterns, signature,
+        children)``.
 
         Nested tables are read through the candidate child URLResolver
         objects -- the very objects resolve() later walks -- rather than
         re-importing them, so building never disturbs a resolver reachable
         from another (still live) table. A child that already serves the
-        candidate table by identity reuses its installed snapshot, so a
-        materialized one-shot iterable is never iterated a second time and an
-        unchanged child is left alone. Every entry must be a pattern with a
-        compilable regex; any failure raises ImproperlyConfigured before
-        anything is installed.
+        candidate table -- by both identity and content fingerprint, so an
+        in-place edit to a nested list is not missed -- reuses its installed
+        snapshot, so a materialized one-shot iterable is never iterated a
+        second time and an unchanged child is left alone. Every entry must be
+        a pattern with a compilable regex; any failure raises
+        ImproperlyConfigured before anything is installed.
         """
         patterns = self._materialize_patterns(patterns_ref, self.urlconf_name)
+        signature = self._patterns_signature(patterns)
         children = []
         for url_pattern in patterns:
             if not isinstance(url_pattern, (URLPattern, URLResolver)):
@@ -1106,42 +1137,51 @@ class URLResolver:
             _ = url_pattern.pattern.regex
             if isinstance(url_pattern, URLResolver):
                 nested_module, nested_ref = url_pattern._current_patterns()
-                if (
-                    url_pattern._loaded
-                    and url_pattern._loaded_patterns_ref is nested_ref
-                ):
-                    # The candidate child already serves this table (a
-                    # reusable list/tuple it holds by reference, or a one-shot
-                    # iterable it snapshotted): reuse it untouched.
+                if url_pattern._matches_loaded_table(nested_ref):
+                    # The candidate child already serves this table (a held
+                    # list/tuple by identity and, for a mutable list, with
+                    # unchanged content, or a one-shot iterable it
+                    # snapshotted): reuse it untouched.
                     continue
-                nested_patterns, nested_children = url_pattern._build_candidate(
-                    nested_module, nested_ref
-                )
+                (
+                    nested_patterns,
+                    nested_signature,
+                    nested_children,
+                ) = url_pattern._build_candidate(nested_module, nested_ref)
                 children.append(
                     (
                         url_pattern,
                         nested_module,
                         nested_ref,
                         nested_patterns,
+                        nested_signature,
                         nested_children,
                     )
                 )
-        return patterns, children
+        return patterns, signature, children
 
     @staticmethod
-    def _install_candidate(patterns, children):
+    def _install_candidate(patterns, signature, children):
         """
         Install a built candidate: nested tables deepest-first, then reset
         this resolver's derived caches. Only called after the whole candidate
         tree has built and validated successfully.
         """
-        for child, child_module, child_ref, child_patterns, child_children in (
-            children
-        ):
-            child._install_candidate(child_patterns, child_children)
+        for (
+            child,
+            child_module,
+            child_ref,
+            child_patterns,
+            child_signature,
+            child_children,
+        ) in children:
+            child._install_candidate(
+                child_patterns, child_signature, child_children
+            )
             child._loaded_urlconf_module = child_module
             child._loaded_patterns_ref = child_ref
             child._loaded_url_patterns = child_patterns
+            child._loaded_patterns_signature = child_signature
             child._patterns_generation += 1
             child._reverse_dict = {}
             child._namespace_dict = {}
@@ -1150,57 +1190,95 @@ class URLResolver:
             child._populated = False
             child._loaded = True
 
+    def _table_matches_signature(self, patterns_ref, signature):
+        """
+        Whether an exposed list still holds the entries captured by
+        *signature* (see _patterns_signature()), in the same order.
+
+        Comparison is by identity and incremental, stopping at the first
+        changed entry, so the common case (the list was not touched) typically
+        does no work beyond reading a length and allocates nothing. Only a
+        mutable list needs this: a tuple is immutable, and a one-shot
+        iterable's content is frozen once consumed, so for either identity is
+        sufficient.
+        """
+        if not isinstance(patterns_ref, list):
+            return True
+        if len(patterns_ref) != len(signature):
+            return False
+        for index, pattern in enumerate(patterns_ref):
+            if pattern is not signature[index]:
+                return False
+        return True
+
+    def _matches_loaded_table(self, patterns_ref):
+        """
+        Whether *patterns_ref* is exactly the routing table currently loaded:
+        the same exposed object and, for a held list edited in place,
+        unchanged content (see _patterns_signature()).
+        """
+        if not self._loaded or patterns_ref is not self._loaded_patterns_ref:
+            return False
+        return self._table_matches_signature(
+            patterns_ref, self._loaded_patterns_signature
+        )
+
     def _reload_patterns(self):
         """
         Make sure the cached urlconf module and its urlpatterns reflect the
         urlconf's current routing table.
 
-        A caller-supplied urlconf may replace its ``urlpatterns`` at runtime
-        (an observable configuration refresh). The currently exposed table is
-        compared by identity with the one held here; a different object means
-        it has been replaced. Identity -- rather than ``id()`` -- is what
-        matters because the held reference keeps the old object alive, so its
-        address can never be reused by a replacement. On refresh the patterns
-        and every cache derived from them (reverse lookups, namespaces and
-        callback strings) are rebuilt from the new table on demand, without
-        the caller clearing any cache.
+        A caller-supplied urlconf may change its ``urlpatterns`` at runtime
+        (an observable configuration refresh) in one of two ways:
+
+        * assigning a new ``urlpatterns`` object, or
+        * editing the existing list in place (``patterns[:] = ...``,
+          append(), pop(), item assignment or a reorder).
+
+        The currently exposed table is compared with the one held here first
+        by identity and then, for a held mutable list, by a content
+        fingerprint (see _patterns_signature()); either kind of difference is
+        a refresh. Identity -- rather than ``id()`` -- is what matters because
+        the held reference keeps the old object alive, so its address can
+        never be reused by a replacement. On refresh the patterns and every
+        cache derived from them (reverse lookups, namespaces and callback
+        strings) are rebuilt from the new table on demand, without the caller
+        clearing any cache or reassigning the urlconf.
 
         A refresh onto a table that fails to load is never committed: the
         whole candidate tree (nested includes included) is built and validated
-        before anything is installed, so an invalid replacement cannot leave a
+        before anything is installed, so an invalid replacement -- including
+        invalid content written into the very same list -- cannot leave a
         half-installed table, the previously working table keeps serving, and
-        the next replacement (e.g. after the table is fixed) takes effect
-        immediately.
+        the next edit (e.g. after the list is fixed) takes effect immediately.
 
         As historically, a urlpatterns that is itself a reusable sequence (a
-        list or tuple, the normal case) is held by reference, so an in-place
-        change such as ``urlpatterns.append(...)`` stays visible to resolve();
-        assigning a new ``urlpatterns`` object is a refresh that also rebuilds
-        the reverse/namespace lookups. A one-shot iterable (a generator) is
-        snapshotted once.
+        list or tuple, the normal case) is held by reference. A one-shot
+        iterable (a generator) is snapshotted once.
         """
-        # Hot path: if the table currently exposed is, by identity, the one
-        # already loaded, there is nothing to do. A held list/tuple is read
-        # by reference, so in-place changes are already visible. This also
-        # avoids an import_module() lookup on every resolve().
+        # Hot path: if the table currently exposed is the one already loaded
+        # -- the same object and, for a held list, unchanged content -- there
+        # is nothing to do. This avoids an import_module() lookup on every
+        # resolve() and keeps the untouched case allocation free.
         if self._loaded:
             current_ref = self._exposed_patterns_ref()
-            if current_ref is not None and current_ref is self._loaded_patterns_ref:
+            if current_ref is not None and self._matches_loaded_table(current_ref):
                 return
         urlconf_module, patterns_ref = self._current_patterns()
-        if self._loaded and patterns_ref is self._loaded_patterns_ref:
+        if self._matches_loaded_table(patterns_ref):
             return
         if self._loaded:
-            # A refresh replaces a table that still works. Build and validate
-            # the entire candidate -- nested includes included -- before
-            # installing any of it; _build_candidate() raises (usually
+            # A refresh replaces or edits a table that still works. Build and
+            # validate the entire candidate -- nested includes included --
+            # before installing any of it; _build_candidate() raises (usually
             # ImproperlyConfigured) without touching self or any resolver
-            # reachable from the live table, so the previous table is left
-            # completely intact.
-            new_patterns, children = self._build_candidate(
+            # reachable from the live table, so the previous table --
+            # including its snapshot of a list that has since been edited in
+            # place -- is left completely intact.
+            new_patterns, new_signature, children = self._build_candidate(
                 urlconf_module, patterns_ref
             )
-            self._install_candidate(new_patterns, children)
+            self._install_candidate(new_patterns, new_signature, children)
         else:
             # An initial load keeps its historical, lazy behavior: hold the
             # exposed sequence (snapshotting a one-shot iterable once) and
@@ -1208,9 +1286,11 @@ class URLResolver:
             new_patterns = self._materialize_patterns(
                 patterns_ref, self.urlconf_name
             )
+            new_signature = self._patterns_signature(new_patterns)
         self._loaded_urlconf_module = urlconf_module
         self._loaded_patterns_ref = patterns_ref
         self._loaded_url_patterns = new_patterns
+        self._loaded_patterns_signature = new_signature
         self._patterns_generation += 1
         self._reverse_dict = {}
         self._namespace_dict = {}
